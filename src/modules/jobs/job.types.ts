@@ -9,4 +9,5 @@ export interface CreateJobInput {
   priority?: number;
   maxAttempts?: number;
   idempotencyKey?: string;
+  callbackUrl?: string;
 }

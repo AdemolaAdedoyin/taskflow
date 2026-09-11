@@ -1,10 +1,32 @@
+import { Job, JobExecution } from "@prisma/client";
 import { Worker, Job as BullJob } from "bullmq";
 import { prisma } from "../db";
 import { config } from "../config";
 import { logger } from "../lib/logger";
+import { CALLBACK_QUEUE_NAME, CallbackPayload, closeCallbackQueueResources } from "./callbackQueue";
+import { deliverCallback, scheduleCompletionCallback } from "./callbackDelivery";
 import { redisConnection } from "./connection";
 import { QUEUE_NAME, JobPayload, closeQueueResources, getNextRecurringRun } from "./jobQueue";
 import { getHandler } from "./handlers";
+import { reconcilePendingCallbacks } from "./reconcile";
+
+async function queueCompletionCallback(job: Job, execution: JobExecution) {
+  if (!job.callbackUrl) return;
+  try {
+    // Finalization happens before callback scheduling. Re-read the durable job
+    // so the callback reports the status clients would observe at delivery time
+    // (SUCCEEDED/FAILED for one-off jobs, SCHEDULED/CANCELLED for recurring jobs)
+    // instead of the stale SCHEDULED/RUNNING snapshot loaded before execution.
+    const finalizedJob = await prisma.job.findUnique({ where: { id: job.id } });
+    if (!finalizedJob) return;
+    await scheduleCompletionCallback(finalizedJob, execution);
+  } catch (error) {
+    // Callback delivery is intentionally decoupled from the business handler.
+    // A Redis outage must not turn a successfully executed job into a retry.
+    // If the durable delivery row was created, startup reconciliation repairs it.
+    logger.error({ err: error, jobId: job.id, executionId: execution.id }, "failed to enqueue completion callback");
+  }
+}
 
 /**
  * Processes one firing of a job (one-off or one cron tick of a recurring
@@ -63,18 +85,19 @@ async function processJob(bullJob: BullJob<JobPayload>) {
     const result = await handler(job.payload, { jobId, attemptNumber });
     const durationMs = Date.now() - startedAt;
 
-    await prisma.jobExecution.update({
+    const completedExecution = await prisma.jobExecution.update({
       where: { id: execution.id },
       data: { status: "SUCCEEDED", finishedAt: new Date(), durationMs, result: result as any },
     });
 
     await finalizeJobAfterRun(job.id, job.scheduleType, { succeeded: true });
+    await queueCompletionCallback(job, completedExecution);
     logger.info({ jobId, attemptNumber, durationMs }, "job succeeded");
   } catch (err: any) {
     const durationMs = Date.now() - startedAt;
     const errorMessage = err?.message ?? "Unknown error";
 
-    await prisma.jobExecution.update({
+    const failedExecution = await prisma.jobExecution.update({
       where: { id: execution.id },
       data: { status: "FAILED", finishedAt: new Date(), durationMs, error: errorMessage },
     });
@@ -87,6 +110,7 @@ async function processJob(bullJob: BullJob<JobPayload>) {
 
     if (isLastAttempt) {
       await finalizeJobAfterRun(job.id, job.scheduleType, { succeeded: false });
+      await queueCompletionCallback(job, failedExecution);
       logger.warn({ jobId, attemptNumber }, "job exhausted all attempts");
     } else {
       logger.info({ jobId, attemptNumber }, "job attempt failed, BullMQ will retry with backoff");
@@ -95,6 +119,12 @@ async function processJob(bullJob: BullJob<JobPayload>) {
     // Re-throw so BullMQ's attempts/backoff configuration takes over.
     throw err;
   }
+}
+
+async function processCallback(bullJob: BullJob<CallbackPayload>) {
+  const attemptNumber = bullJob.attemptsMade + 1;
+  await deliverCallback(bullJob.data.deliveryId, attemptNumber);
+  logger.info({ deliveryId: bullJob.data.deliveryId, attemptNumber }, "completion callback delivered");
 }
 
 async function finalizeJobAfterRun(
@@ -124,8 +154,21 @@ export const jobWorker = new Worker<JobPayload>(QUEUE_NAME, processJob, {
   concurrency: config.JOB_CONCURRENCY,
 });
 
+export const callbackWorker = new Worker<CallbackPayload>(CALLBACK_QUEUE_NAME, processCallback, {
+  connection: redisConnection,
+  concurrency: config.CALLBACK_CONCURRENCY,
+});
+
 jobWorker.on("error", (err) => {
-  logger.error({ err }, "worker-level error (e.g. Redis connection issue)");
+  logger.error({ err }, "job worker-level error (e.g. Redis connection issue)");
+});
+
+callbackWorker.on("error", (err) => {
+  logger.error({ err }, "callback worker-level error (e.g. Redis connection issue)");
+});
+
+void reconcilePendingCallbacks().catch((error) => {
+  logger.error({ err: error }, "worker callback reconciliation failed");
 });
 
 let shuttingDown = false;
@@ -138,8 +181,9 @@ async function shutdown(signal: string) {
   forceExit.unref();
 
   try {
-    // BullMQ waits for active handlers to settle and stops taking new work.
-    await jobWorker.close();
+    // BullMQ waits for active handlers/deliveries to settle and stops taking new work.
+    await Promise.all([jobWorker.close(), callbackWorker.close()]);
+    await closeCallbackQueueResources();
     await closeQueueResources();
     await prisma.$disconnect();
     clearTimeout(forceExit);

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../../db";
+import { callbackQueue } from "../../queue/callbackQueue";
 import { jobQueue } from "../../queue/jobQueue";
 import { requireAuth } from "../../middleware/auth";
 
@@ -7,17 +8,26 @@ export const operationsRouter = Router();
 
 operationsRouter.get("/overview", requireAuth, async (_req, res, next) => {
   try {
-    const [queueCounts, groupedJobs] = await Promise.all([
+    const [jobQueueCounts, callbackQueueCounts, groupedJobs, groupedCallbacks] = await Promise.all([
       jobQueue.getJobCounts("waiting", "active", "delayed", "completed", "failed", "paused"),
+      callbackQueue.getJobCounts("waiting", "active", "delayed", "completed", "failed", "paused"),
       prisma.job.groupBy({ by: ["status"], _count: { _all: true } }),
+      prisma.callbackDelivery.groupBy({ by: ["status"], _count: { _all: true } }),
     ]);
 
     const jobsByStatus = Object.fromEntries(groupedJobs.map((entry) => [entry.status, entry._count._all]));
+    const callbacksByStatus = Object.fromEntries(
+      groupedCallbacks.map((entry) => [entry.status, entry._count._all])
+    );
 
     res.json({
       timestamp: new Date().toISOString(),
       process: { uptimeSeconds: Math.round(process.uptime()) },
-      queue: queueCounts,
+      queue: jobQueueCounts,
+      callbacks: {
+        queue: callbackQueueCounts,
+        deliveries: callbacksByStatus,
+      },
       jobs: jobsByStatus,
     });
   } catch (error) {

@@ -32,41 +32,69 @@ enum ExecutionStatus {
   FAILED
 }
 
+enum CallbackDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
 model Job {
-  id             String        @id @default(cuid())
-  type           String // maps to a registered handler, e.g. "http_request"
-  payload        Json
-  scheduleType   ScheduleType
-  runAt          DateTime? // ONCE jobs: when to run (null = as soon as possible)
-  cronExpression String? // RECURRING jobs: standard 5-field cron
-  timezone       String        @default("UTC")
-  priority       Int           @default(0) // lower runs first, matches BullMQ convention
-  maxAttempts    Int           @default(5)
-  attemptCount   Int           @default(0) // attempts used in the most recent execution cycle
-  idempotencyKey String?       @unique
-  status         JobStatus     @default(SCHEDULED)
-  lastError      String?
-  lastRunAt      DateTime?
-  nextRunAt      DateTime?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  executions     JobExecution[]
+  id                 String             @id @default(cuid())
+  type               String // maps to a registered handler, e.g. "http_request"
+  payload            Json
+  scheduleType       ScheduleType
+  runAt              DateTime? // ONCE jobs: when to run (null = as soon as possible)
+  cronExpression     String? // RECURRING jobs: standard 5-field cron
+  timezone           String             @default("UTC")
+  priority           Int                @default(0) // lower runs first, matches BullMQ convention
+  maxAttempts        Int                @default(5)
+  attemptCount       Int                @default(0) // attempts used in the most recent execution cycle
+  idempotencyKey     String?            @unique
+  callbackUrl        String?
+  status             JobStatus          @default(SCHEDULED)
+  lastError          String?
+  lastRunAt          DateTime?
+  nextRunAt          DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  executions         JobExecution[]
+  callbackDeliveries CallbackDelivery[]
 
   @@index([status, type])
   @@index([scheduleType, status])
 }
 
 model JobExecution {
-  id            String          @id @default(cuid())
-  job           Job             @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  jobId         String
-  attemptNumber Int
-  status        ExecutionStatus @default(RUNNING)
-  startedAt     DateTime        @default(now())
-  finishedAt    DateTime?
-  durationMs    Int?
-  result        Json?
-  error         String?
+  id               String            @id @default(cuid())
+  job              Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId            String
+  attemptNumber    Int
+  status           ExecutionStatus   @default(RUNNING)
+  startedAt        DateTime          @default(now())
+  finishedAt       DateTime?
+  durationMs       Int?
+  result           Json?
+  error            String?
+  callbackDelivery CallbackDelivery?
 
   @@index([jobId, startedAt, id])
+}
+
+model CallbackDelivery {
+  id             String                 @id @default(cuid())
+  job            Job                    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId          String
+  execution      JobExecution           @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  executionId    String                 @unique
+  url            String
+  status         CallbackDeliveryStatus @default(PENDING)
+  attemptCount   Int                    @default(0)
+  responseStatus Int?
+  lastError      String?
+  deliveredAt    DateTime?
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  @@index([status, createdAt])
+  @@index([jobId, createdAt])
 }

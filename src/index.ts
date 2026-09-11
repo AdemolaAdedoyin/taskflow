@@ -2,8 +2,9 @@ import { createApp } from "./app";
 import { config } from "./config";
 import { logger } from "./lib/logger";
 import { prisma } from "./db";
+import { closeCallbackQueueResources } from "./queue/callbackQueue";
 import { closeQueueResources } from "./queue/jobQueue";
-import { reconcileScheduledJobs } from "./queue/reconcile";
+import { reconcilePendingCallbacks, reconcileScheduledJobs } from "./queue/reconcile";
 
 const app = createApp();
 let server: ReturnType<typeof app.listen> | undefined;
@@ -11,11 +12,10 @@ let shuttingDown = false;
 
 async function bootstrap() {
   try {
-    await reconcileScheduledJobs();
+    await Promise.all([reconcileScheduledJobs(), reconcilePendingCallbacks()]);
   } catch (error) {
     // Reconciliation is a recovery mechanism, not a reason to make the HTTP
-    // API unavailable. Individual create requests still surface Redis errors,
-    // and another restart/retry can repair durable SCHEDULED jobs later.
+    // API unavailable. Durable rows remain available for another restart/retry.
     logger.error({ err: error }, "startup queue reconciliation failed");
   }
 
@@ -25,7 +25,11 @@ async function bootstrap() {
 }
 
 async function closeDependencies() {
-  await Promise.allSettled([closeQueueResources(), prisma.$disconnect()]);
+  // Both queues share one IORedis client. Close queue wrappers first, then let
+  // closeQueueResources terminate the shared connection.
+  await closeCallbackQueueResources().catch(() => undefined);
+  await closeQueueResources().catch(() => undefined);
+  await prisma.$disconnect().catch(() => undefined);
 }
 
 async function shutdown(signal: string) {

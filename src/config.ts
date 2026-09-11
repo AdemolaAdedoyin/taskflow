@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { z } from "zod";
 
+const commaSeparated = z
+  .string()
+  .default("")
+  .transform((value) => value.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean));
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -14,10 +19,12 @@ const envSchema = z.object({
     .string()
     .default("")
     .transform((value) => value.split(",").map((origin) => origin.trim()).filter(Boolean)),
-  HTTP_ALLOWED_HOSTS: z
-    .string()
-    .default("")
-    .transform((value) => value.split(",").map((host) => host.trim().toLowerCase()).filter(Boolean)),
+  HTTP_ALLOWED_HOSTS: commaSeparated,
+  CALLBACK_ALLOWED_HOSTS: commaSeparated,
+  CALLBACK_SIGNING_SECRET: z.string().default("dev-callback-signing-secret"),
+  CALLBACK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+  CALLBACK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  CALLBACK_CONCURRENCY: z.coerce.number().int().positive().default(5),
   API_RATE_LIMIT_REQUESTS: z.coerce.number().int().positive().default(600),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(0),
@@ -34,6 +41,18 @@ if (!parsed.success) {
 if (parsed.data.NODE_ENV === "production" && parsed.data.TASKFLOW_API_KEY.length < 32) {
   console.error("Invalid environment configuration:");
   console.error({ TASKFLOW_API_KEY: ["TASKFLOW_API_KEY must be at least 32 characters in production"] });
+  process.exit(1);
+}
+
+if (
+  parsed.data.NODE_ENV === "production" &&
+  parsed.data.CALLBACK_ALLOWED_HOSTS.length > 0 &&
+  parsed.data.CALLBACK_SIGNING_SECRET.length < 32
+) {
+  console.error("Invalid environment configuration:");
+  console.error({
+    CALLBACK_SIGNING_SECRET: ["CALLBACK_SIGNING_SECRET must be at least 32 characters when callbacks are enabled in production"],
+  });
   process.exit(1);
 }
 
