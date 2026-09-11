@@ -8,15 +8,20 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-async function post(path: string, body: unknown) {
+type CreatedJob = { id: string };
+
+async function post(path: string, body: unknown): Promise<CreatedJob> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
     body: JSON.stringify(body),
   });
-  const json = await res.json();
+  const json = (await res.json()) as unknown;
   if (!res.ok) throw new Error(`${path} failed: ${JSON.stringify(json)}`);
-  return json;
+  if (!json || typeof json !== "object" || !("id" in json) || typeof json.id !== "string") {
+    throw new Error(`${path} returned an unexpected response: ${JSON.stringify(json)}`);
+  }
+  return { id: json.id };
 }
 
 async function main() {
