@@ -24,11 +24,22 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       NODE_ENV: test
       DATABASE_URL: postgresql://taskflow:taskflow@localhost:5432/taskflow_test?schema=public
       REDIS_URL: redis://localhost:6379
       TASKFLOW_API_KEY: ci-test-key
+      RUN_INTEGRATION_TESTS: "true"
 
     steps:
       - name: Checkout
@@ -52,7 +63,7 @@ jobs:
       - name: Apply migrations to a fresh database
         run: npm run prisma:deploy
 
-      - name: Run tests
+      - name: Run unit and integration tests
         run: npm test
 
       - name: Build
