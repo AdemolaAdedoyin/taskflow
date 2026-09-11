@@ -16,6 +16,8 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   JOB_CONCURRENCY: z.coerce.number().int().positive().default(10),
   JOB_DEFAULT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  EXECUTION_HEARTBEAT_INTERVAL_MS: z.coerce.number().int().min(1_000).default(10_000),
+  EXECUTION_STALE_AFTER_MS: z.coerce.number().int().min(10_000).default(60_000),
   HANDLER_CONCURRENCY_LIMITS: z.string().default(""),
   HANDLER_RATE_LIMITS: z.string().default(""),
   HANDLER_LIMIT_RETRY_DELAY_MS: z.coerce.number().int().positive().default(250),
@@ -42,6 +44,14 @@ const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error("Invalid environment configuration:");
   console.error(parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+if (parsed.data.EXECUTION_STALE_AFTER_MS < parsed.data.EXECUTION_HEARTBEAT_INTERVAL_MS * 3) {
+  console.error("Invalid environment configuration:");
+  console.error({
+    EXECUTION_STALE_AFTER_MS: ["EXECUTION_STALE_AFTER_MS must be at least 3x EXECUTION_HEARTBEAT_INTERVAL_MS"],
+  });
   process.exit(1);
 }
 
