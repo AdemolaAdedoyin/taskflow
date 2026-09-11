@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { parseHandlerConcurrencyLimits, parseHandlerRateLimits } from "./lib/handlerLimitsConfig";
 
 const commaSeparated = z
   .string()
@@ -14,6 +15,10 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default("info"),
   JOB_CONCURRENCY: z.coerce.number().int().positive().default(10),
   JOB_DEFAULT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  HANDLER_CONCURRENCY_LIMITS: z.string().default(""),
+  HANDLER_RATE_LIMITS: z.string().default(""),
+  HANDLER_LIMIT_RETRY_DELAY_MS: z.coerce.number().int().positive().default(250),
+  HANDLER_PERMIT_TTL_MS: z.coerce.number().int().min(5_000).default(60_000),
   TASKFLOW_API_KEY: z.string().min(1, "TASKFLOW_API_KEY is required"),
   CORS_ORIGINS: z
     .string()
@@ -56,4 +61,19 @@ if (
   process.exit(1);
 }
 
-export const config = parsed.data;
+let handlerConcurrencyLimits: Record<string, number>;
+let handlerRateLimits: Record<string, { max: number; windowMs: number }>;
+try {
+  handlerConcurrencyLimits = parseHandlerConcurrencyLimits(parsed.data.HANDLER_CONCURRENCY_LIMITS);
+  handlerRateLimits = parseHandlerRateLimits(parsed.data.HANDLER_RATE_LIMITS);
+} catch (error: any) {
+  console.error("Invalid environment configuration:");
+  console.error({ HANDLER_LIMITS: [error?.message ?? "Invalid handler limit configuration"] });
+  process.exit(1);
+}
+
+export const config = {
+  ...parsed.data,
+  HANDLER_CONCURRENCY_LIMITS: handlerConcurrencyLimits,
+  HANDLER_RATE_LIMITS: handlerRateLimits,
+};
