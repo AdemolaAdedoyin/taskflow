@@ -66,7 +66,12 @@ export async function assertSafeHttpUrl(rawUrl: string, resolver: HostResolver =
     throw new Error("HTTP job target URLs must not contain embedded credentials");
   }
 
-  const hostname = url.hostname.toLowerCase();
+  // WHATWG URLs retain brackets around IPv6 literals in `hostname`.
+  const rawHostname = url.hostname.toLowerCase();
+  const hostname = rawHostname.startsWith("[") && rawHostname.endsWith("]")
+    ? rawHostname.slice(1, -1)
+    : rawHostname;
+
   if (
     hostname === "localhost" ||
     hostname.endsWith(".localhost") ||
