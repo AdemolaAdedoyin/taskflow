@@ -37,6 +37,12 @@ const listSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
 
+const executionListSchema = z.object({
+  status: z.enum(["RUNNING", "SUCCEEDED", "FAILED"]).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).max(1024).optional(),
+});
+
 jobRouter.post("/", async (req, res, next) => {
   try {
     const parsed = createSchema.safeParse(req.body);
@@ -60,6 +66,16 @@ jobRouter.get("/", async (req, res, next) => {
     const parsed = listSchema.safeParse(req.query);
     if (!parsed.success) throw new ValidationError(parsed.error.flatten());
     res.json(await jobService.listJobs(parsed.data));
+  } catch (err) {
+    next(err);
+  }
+});
+
+jobRouter.get("/:id/executions", async (req, res, next) => {
+  try {
+    const parsed = executionListSchema.safeParse(req.query);
+    if (!parsed.success) throw new ValidationError(parsed.error.flatten());
+    res.json(await jobService.listJobExecutions(req.params.id, parsed.data));
   } catch (err) {
     next(err);
   }
