@@ -6,6 +6,7 @@ import { rateLimit } from "express-rate-limit";
 import pinoHttp from "pino-http";
 import swaggerUi from "swagger-ui-express";
 import YAML from "yaml";
+import { config } from "./config";
 import { logger } from "./lib/logger";
 import { requireAuth } from "./middleware/auth";
 import { errorHandler } from "./middleware/errorHandler";
@@ -14,18 +15,23 @@ import { jobRouter } from "./modules/jobs/job.routes";
 export function createApp() {
   const app = express();
 
-  app.use(cors());
-  app.use(express.json({ limit: "1mb" }));
-  app.use(pinoHttp({ logger }));
+  if (config.TRUST_PROXY_HOPS > 0) {
+    app.set("trust proxy", config.TRUST_PROXY_HOPS);
+  }
 
+  const allowedOrigins = new Set(config.CORS_ORIGINS);
   app.use(
-    rateLimit({
-      windowMs: 60_000,
-      limit: 600,
-      standardHeaders: true,
-      legacyHeaders: false,
+    cors({
+      origin(origin, callback) {
+        // Requests without Origin are server-to-server/same-origin and do not
+        // need CORS permission. Cross-origin browser access is allowlisted.
+        if (!origin) return callback(null, true);
+        return callback(null, allowedOrigins.has(origin));
+      },
     })
   );
+  app.use(express.json({ limit: "1mb" }));
+  app.use(pinoHttp({ logger }));
 
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
@@ -33,6 +39,17 @@ export function createApp() {
   app.get("/openapi.json", (_req, res) => res.json(openapiDocument));
   app.use("/docs", swaggerUi.serve, swaggerUi.setup(openapiDocument));
 
+  // Apply abuse protection only to the authenticated API surface; health and
+  // documentation remain available for probes and interactive discovery.
+  app.use(
+    "/v1",
+    rateLimit({
+      windowMs: config.API_RATE_LIMIT_WINDOW_MS,
+      limit: config.API_RATE_LIMIT_REQUESTS,
+      standardHeaders: true,
+      legacyHeaders: false,
+    })
+  );
   app.use("/v1/jobs", requireAuth, jobRouter);
 
   app.use((req, res) => {
