@@ -1,5 +1,6 @@
 import { prisma } from "../db";
 import { logger } from "../lib/logger";
+import { enqueueCallbackDelivery } from "./callbackQueue";
 import { ensureJobScheduled } from "./jobQueue";
 
 export async function reconcileScheduledJobs() {
@@ -27,4 +28,30 @@ export async function reconcileScheduledJobs() {
   );
 
   return { checked: scheduledJobs.length, repaired, failed };
+}
+
+export async function reconcilePendingCallbacks() {
+  const pending = await prisma.callbackDelivery.findMany({
+    where: { status: "PENDING" },
+    orderBy: { createdAt: "asc" },
+    take: 1_000,
+  });
+
+  let repaired = 0;
+  let failed = 0;
+  for (const delivery of pending) {
+    try {
+      await enqueueCallbackDelivery(delivery.id);
+      repaired += 1;
+    } catch (error) {
+      failed += 1;
+      logger.error({ err: error, deliveryId: delivery.id }, "failed to reconcile callback delivery into Redis");
+    }
+  }
+
+  logger.info(
+    { checked: pending.length, repaired, failed },
+    "callback-delivery reconciliation completed"
+  );
+  return { checked: pending.length, repaired, failed };
 }
