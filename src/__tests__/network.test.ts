@@ -12,6 +12,7 @@ describe("outbound HTTP target validation", () => {
   it("rejects loopback and private literal addresses", async () => {
     await expect(assertSafeHttpUrl("http://127.0.0.1/admin")).rejects.toThrow(/private or reserved/);
     await expect(assertSafeHttpUrl("http://10.2.3.4/internal")).rejects.toThrow(/private or reserved/);
+    await expect(assertSafeHttpUrl("http://[::1]/internal")).rejects.toThrow(/private or reserved/);
   });
 
   it("rejects a public hostname if DNS resolves it to a private address", async () => {
