@@ -13,9 +13,10 @@ I built Taskflow as a backend-focused job scheduling service for work that needs
 - **One-off + recurring scheduling** — delayed jobs use deterministic BullMQ IDs; recurring jobs use BullMQ v5 Job Schedulers.
 - **Concurrency-safe execution** — first attempts atomically claim `SCHEDULED` jobs in PostgreSQL so cancellation and overlapping recurring ticks cannot both win.
 - **Retry audit trail** — BullMQ owns retry/backoff mechanics while every attempt is persisted as a `JobExecution` row.
+- **Scalable execution history** — long-running recurring jobs expose cursor-paginated, filterable execution history instead of forcing unbounded relation loads.
 - **Security boundaries** — bearer-token authentication, configurable rate limits/CORS/proxy handling, SSRF defenses, redirect blocking, and production outbound-host allowlisting for `http_request` jobs.
 - **Operational visibility** — request IDs, structured logs, liveness/readiness probes, queue counts, durable status counts, and process uptime.
-- **Real integration coverage** — CI starts PostgreSQL and Redis, applies migrations, exercises the HTTP API, verifies durable rows and queue projections, then builds the TypeScript project.
+- **Real integration coverage** — CI starts PostgreSQL and Redis, applies migrations, exercises the HTTP API, verifies durable rows and queue projections, then builds the TypeScript project and production container.
 
 ## Architecture
 
@@ -57,7 +58,8 @@ The OpenAPI document is served at `/openapi.json`, with interactive Swagger UI a
 | --- | --- |
 | `POST /v1/jobs` | Create a one-off or recurring job |
 | `GET /v1/jobs` | Filter/list jobs |
-| `GET /v1/jobs/:id` | Job detail + recent execution history |
+| `GET /v1/jobs/:id` | Job detail + 20 most recent executions |
+| `GET /v1/jobs/:id/executions` | Cursor-paginated execution history with status filtering |
 | `POST /v1/jobs/:id/cancel` | Cancel a scheduled job safely |
 | `GET /v1/operations/overview` | Authenticated queue + durable-state overview |
 | `GET /health/live` | Process liveness |
@@ -71,6 +73,15 @@ Authorization: Bearer <TASKFLOW_API_KEY>
 ```
 
 Every request gets an `x-request-id`. A valid incoming ID is preserved; otherwise Taskflow generates one and returns it in the response.
+
+Execution history uses an opaque cursor so a recurring job can accumulate a large audit trail without offset scans or duplicate rows between pages:
+
+```bash
+curl -H "Authorization: Bearer <your key>" \
+  "http://localhost:4000/v1/jobs/<job-id>/executions?status=FAILED&limit=50"
+```
+
+Follow `pageInfo.nextCursor` until `pageInfo.hasMore` is false.
 
 ## Run locally
 
@@ -167,7 +178,7 @@ For the real runtime integration suite, start PostgreSQL + Redis with the config
 RUN_INTEGRATION_TESTS=true npm test
 ```
 
-GitHub Actions automatically runs the full path on every PR: dependency install, Prisma generation/schema validation, migrations against a fresh PostgreSQL instance, unit + Postgres/Redis integration tests, and the TypeScript build.
+GitHub Actions automatically runs the full path on every PR: dependency install, production dependency audit, Prisma generation/schema validation, migrations against a fresh PostgreSQL instance, unit + Postgres/Redis integration tests, TypeScript build, and production Docker image build.
 
 ## Reliability decisions
 
@@ -176,6 +187,8 @@ GitHub Actions automatically runs the full path on every PR: dependency install,
 **Durable cancellation before queue cleanup.** Cancellation atomically changes `SCHEDULED -> CANCELLED` in PostgreSQL before attempting Redis cleanup. Even if cleanup fails, the worker cannot legitimately claim the job afterward.
 
 **No fake cancellation of active handlers.** Arbitrary handler code cannot be safely pre-empted, so Taskflow returns a conflict instead of claiming that a `RUNNING` job was cancelled.
+
+**Cursor pagination for audit history.** Execution pages are ordered by `startedAt` and `id`, with an opaque cursor carrying both values. A matching composite PostgreSQL index keeps per-job history scans efficient and deterministic.
 
 **Graceful shutdown.** The API stops accepting traffic before closing queue/Redis/Postgres resources; the worker stops taking new work and waits for active handlers before disconnecting dependencies.
 
@@ -205,4 +218,4 @@ openapi.yaml
 
 ## Next steps
 
-I would extend Taskflow next with paginated execution-history endpoints, callback/webhook delivery on job completion, per-handler concurrency/rate limits, stronger multi-client authentication/authorization, metrics export for Prometheus/OpenTelemetry, and a production deployment example using managed PostgreSQL and Redis.
+I would extend Taskflow next with callback/webhook delivery on job completion, per-handler concurrency/rate limits, stronger multi-client authentication/authorization, metrics export for Prometheus/OpenTelemetry, and a production deployment example using managed PostgreSQL and Redis.
