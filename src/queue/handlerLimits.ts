@@ -15,31 +15,35 @@ export interface HandlerExecutionSlot {
 
 const acquirePermitScript = `
 local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local expiresAt = tonumber(ARGV[2])
-local token = ARGV[3]
-local limit = tonumber(ARGV[4])
-local ttl = tonumber(ARGV[5])
+local token = ARGV[1]
+local limit = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local time = redis.call('TIME')
+local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+local expiresAt = now + ttl
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 if redis.call('ZCARD', key) >= limit then
   return 0
 end
 redis.call('ZADD', key, expiresAt, token)
-redis.call('PEXPIRE', key, ttl)
+redis.call('PEXPIRE', key, ttl * 2)
 return 1
 `;
 
 const renewPermitScript = `
 local key = KEYS[1]
 local token = ARGV[1]
-local expiresAt = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
-if redis.call('ZSCORE', key, token) then
-  redis.call('ZADD', key, expiresAt, token)
-  redis.call('PEXPIRE', key, ttl)
-  return 1
+local ttl = tonumber(ARGV[2])
+local time = redis.call('TIME')
+local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+local score = redis.call('ZSCORE', key, token)
+if not score or tonumber(score) <= now then
+  redis.call('ZREM', key, token)
+  return 0
 end
-return 0
+redis.call('ZADD', key, now + ttl, token)
+redis.call('PEXPIRE', key, ttl * 2)
+return 1
 `;
 
 const consumeRateScript = `
@@ -97,18 +101,15 @@ export async function acquireHandlerExecutionSlot(
 
   if (policy.concurrency) {
     permitToken = randomUUID();
-    const now = Date.now();
     const ttl = config.HANDLER_PERMIT_TTL_MS;
     const acquired = Number(
       await redisConnection.eval(
         acquirePermitScript,
         1,
         concurrencyKey(type),
-        now,
-        now + ttl,
         permitToken,
         policy.concurrency,
-        ttl * 2
+        ttl
       )
     );
 
@@ -120,9 +121,13 @@ export async function acquireHandlerExecutionSlot(
     const renewalEveryMs = Math.max(1_000, Math.floor(ttl / 3));
     renewalTimer = setInterval(() => {
       if (!permitToken || released) return;
-      const expiresAt = Date.now() + ttl;
       void redisConnection
-        .eval(renewPermitScript, 1, concurrencyKey(type), permitToken, expiresAt, ttl * 2)
+        .eval(renewPermitScript, 1, concurrencyKey(type), permitToken, ttl)
+        .then((renewed) => {
+          if (Number(renewed) !== 1) {
+            logger.warn({ handlerType: type }, "handler concurrency permit expired before renewal");
+          }
+        })
         .catch((error) => logger.warn({ err: error, handlerType: type }, "handler concurrency permit renewal failed"));
     }, renewalEveryMs);
     renewalTimer.unref();
