@@ -37,6 +37,18 @@ services:
       REDIS_URL: redis://redis:6379
       PORT: 4000
       TASKFLOW_API_KEY: ${TASKFLOW_API_KEY:-dev-local-key}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health/live').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
