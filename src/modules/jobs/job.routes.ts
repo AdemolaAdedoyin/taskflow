@@ -23,6 +23,13 @@ const createSchema = z.object({
   idempotencyKey: z.string().min(1).max(200).optional(),
 });
 
+const listSchema = z.object({
+  status: z.enum(["SCHEDULED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"]).optional(),
+  type: z.string().min(1).optional(),
+  scheduleType: z.enum(["ONCE", "RECURRING"]).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
 jobRouter.post("/", async (req, res, next) => {
   try {
     const parsed = createSchema.safeParse(req.body);
@@ -36,11 +43,9 @@ jobRouter.post("/", async (req, res, next) => {
 
 jobRouter.get("/", async (req, res, next) => {
   try {
-    const status = typeof req.query.status === "string" ? req.query.status : undefined;
-    const type = typeof req.query.type === "string" ? req.query.type : undefined;
-    const scheduleType = typeof req.query.scheduleType === "string" ? req.query.scheduleType : undefined;
-    const limit = Math.min(Number(req.query.limit) || 50, 200);
-    res.json(await jobService.listJobs({ status, type, scheduleType, limit }));
+    const parsed = listSchema.safeParse(req.query);
+    if (!parsed.success) throw new ValidationError(parsed.error.flatten());
+    res.json(await jobService.listJobs(parsed.data));
   } catch (err) {
     next(err);
   }
