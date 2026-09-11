@@ -10,16 +10,18 @@ integration("Postgres + Redis runtime integration", () => {
   let closeQueueResources: () => Promise<void>;
   let closeCallbackQueueResources: () => Promise<void>;
   let scheduleCompletionCallback: (job: any, execution: any) => Promise<any>;
+  let acquireHandlerExecutionSlot: (type: string, policy?: any) => Promise<any>;
   let server: any;
   let baseUrl = "";
 
   beforeAll(async () => {
-    const [{ createApp }, db, queue, callbackQueueModule, callbackDelivery] = await Promise.all([
+    const [{ createApp }, db, queue, callbackQueueModule, callbackDelivery, handlerLimits] = await Promise.all([
       import("../../app"),
       import("../../db"),
       import("../../queue/jobQueue"),
       import("../../queue/callbackQueue"),
       import("../../queue/callbackDelivery"),
+      import("../../queue/handlerLimits"),
     ]);
 
     prisma = db.prisma;
@@ -28,6 +30,7 @@ integration("Postgres + Redis runtime integration", () => {
     closeQueueResources = queue.closeQueueResources;
     closeCallbackQueueResources = callbackQueueModule.closeCallbackQueueResources;
     scheduleCompletionCallback = callbackDelivery.scheduleCompletionCallback;
+    acquireHandlerExecutionSlot = handlerLimits.acquireHandlerExecutionSlot;
 
     await Promise.all([
       jobQueue.obliterate({ force: true }),
@@ -153,6 +156,28 @@ integration("Postgres + Redis runtime integration", () => {
 
     const queued = await callbackQueue.getJob(`callback-${delivery.id}`);
     expect(queued?.data).toEqual({ deliveryId: delivery.id });
+  });
+
+  it("coordinates per-handler concurrency and rate limits through Redis", async () => {
+    const concurrencyType = `integration-concurrency-${Date.now()}`;
+    const first = await acquireHandlerExecutionSlot(concurrencyType, { concurrency: 1 });
+    expect(first.delayMs).toBe(0);
+
+    const blocked = await acquireHandlerExecutionSlot(concurrencyType, { concurrency: 1 });
+    expect(blocked.delayMs).toBeGreaterThan(0);
+
+    await first.release();
+    const afterRelease = await acquireHandlerExecutionSlot(concurrencyType, { concurrency: 1 });
+    expect(afterRelease.delayMs).toBe(0);
+    await afterRelease.release();
+
+    const rateType = `integration-rate-${Date.now()}`;
+    const allowed = await acquireHandlerExecutionSlot(rateType, { rate: { max: 1, windowMs: 150 } });
+    expect(allowed.delayMs).toBe(0);
+    await allowed.release();
+
+    const rateLimited = await acquireHandlerExecutionSlot(rateType, { rate: { max: 1, windowMs: 150 } });
+    expect(rateLimited.delayMs).toBeGreaterThan(0);
   });
 
   it("paginates durable execution history without duplicates", async () => {
