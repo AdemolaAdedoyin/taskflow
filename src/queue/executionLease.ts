@@ -67,3 +67,50 @@ export async function finishExecution(
   if (!execution) throw new ExecutionLeaseLostError(executionId);
   return execution;
 }
+
+export async function recoverStaleExecutions(jobId?: string) {
+  const cutoff = new Date(Date.now() - config.EXECUTION_STALE_AFTER_MS);
+  const staleExecutions = await prisma.jobExecution.findMany({
+    where: {
+      status: "RUNNING",
+      heartbeatAt: { lte: cutoff },
+      ...(jobId ? { jobId } : {}),
+    },
+    orderBy: { heartbeatAt: "asc" },
+    take: 1_000,
+  });
+
+  let recovered = 0;
+  for (const execution of staleExecutions) {
+    const didRecover = await prisma.$transaction(async (tx) => {
+      const executionUpdate = await tx.jobExecution.updateMany({
+        where: {
+          id: execution.id,
+          status: "RUNNING",
+          heartbeatAt: { lte: cutoff },
+        },
+        data: {
+          status: "FAILED",
+          finishedAt: new Date(),
+          durationMs: Math.max(0, Date.now() - execution.startedAt.getTime()),
+          error: "Execution abandoned after worker heartbeat expired",
+        },
+      });
+
+      if (executionUpdate.count === 0) return false;
+
+      await tx.job.updateMany({
+        where: { id: execution.jobId, status: "RUNNING" },
+        data: {
+          status: "SCHEDULED",
+          lastError: "Previous execution was recovered after its worker heartbeat expired",
+        },
+      });
+      return true;
+    });
+
+    if (didRecover) recovered += 1;
+  }
+
+  return { checked: staleExecutions.length, recovered };
+}
