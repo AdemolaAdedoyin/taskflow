@@ -5,8 +5,10 @@ info:
     Durable job scheduling and queue service. PostgreSQL stores job definitions,
     execution history, and callback-delivery state while Redis/BullMQ provides
     delayed, recurring, retry, and completion-callback execution. Production API
-    callers authenticate as named clients with least-privilege scopes.
-  version: "1.4"
+    callers authenticate as named clients with least-privilege scopes. Every HTTP
+    response includes an x-request-id for correlation. See docs/API_GUIDE.md for
+    lifecycle, error, pagination, callback, and operational semantics.
+  version: "1.5"
 servers:
   - url: http://localhost:4000
 security:
@@ -52,6 +54,32 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadinessHealth"
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: >
+        Requires `operations.read`. Returns Prometheus text exposition for
+        process uptime, durable job status counts, BullMQ business-job states,
+        durable callback-delivery counts, and callback queue states. This endpoint
+        is intentionally outside the normal `/v1` API rate limiter so a trusted
+        scraper can poll at a fixed cadence.
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP taskflow_process_uptime_seconds Process uptime in seconds.
+                # TYPE taskflow_process_uptime_seconds gauge
+                taskflow_process_uptime_seconds 42
+                taskflow_jobs{status="SCHEDULED"} 3
+                taskflow_job_queue_jobs{state="waiting"} 1
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /v1/auth/whoami:
     get:
       summary: Inspect the authenticated API client
@@ -63,6 +91,9 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthIdentity"
+              example:
+                clientId: reader
+                scopes: [jobs.read]
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -83,8 +114,16 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateJobRequest"
             examples:
+              immediateOnce:
+                summary: Immediate one-off job
+                value:
+                  type: log_message
+                  payload: { message: "run now" }
+                  schedule: { type: once }
+                  idempotencyKey: demo-now-1
+                  maxAttempts: 3
               delayedOnce:
-                summary: One-off job
+                summary: Delayed one-off job
                 value:
                   type: log_message
                   payload: { message: "run this later" }
@@ -147,9 +186,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "422":
-          description: Validation error or callback destination not allowed
+          $ref: "#/components/responses/Validation"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
     get:
       summary: List jobs
       description: Requires `jobs.read`.
@@ -183,9 +224,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "422":
-          description: Invalid filter
+          $ref: "#/components/responses/Validation"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/jobs/{id}:
     get:
       summary: Get a job and recent execution history
@@ -204,9 +247,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Job not found
+          $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/jobs/{id}/executions:
     get:
       summary: List job execution history
@@ -225,7 +270,7 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
         - name: cursor
           in: query
-          description: Opaque cursor returned by the previous page.
+          description: Opaque cursor returned by the previous page. Do not construct or decode it in clients.
           schema: { type: string, maxLength: 1024 }
       responses:
         "200":
@@ -239,11 +284,13 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Job not found
+          $ref: "#/components/responses/NotFound"
         "422":
-          description: Invalid status, limit, or cursor
+          $ref: "#/components/responses/Validation"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/jobs/{id}/cancel:
     post:
       summary: Cancel a scheduled job
@@ -266,11 +313,13 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Job not found
+          $ref: "#/components/responses/NotFound"
         "409":
-          description: Job is running or already terminal
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /v1/operations/overview:
     get:
       summary: Runtime operations overview
@@ -288,6 +337,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
   securitySchemes:
     bearerAuth:
@@ -301,15 +352,85 @@ components:
       name: id
       in: path
       required: true
-      schema: { type: string }
+      schema: { type: string, minLength: 1 }
   responses:
     Unauthorized:
       description: Missing or invalid bearer credential
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: Missing or invalid API key
     Forbidden:
       description: Authenticated client lacks the required scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: FORBIDDEN
+              message: API client 'reader' requires scope 'jobs.write'
+    NotFound:
+      description: Requested resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: NOT_FOUND
+              message: Job 'example-id' not found
+    Conflict:
+      description: Operation conflicts with current durable state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: CONFLICT
+              message: Job cannot be cancelled from its current state
+    Validation:
+      description: Request body, query, cursor, schedule, or destination failed validation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Request failed validation
+              details: {}
     RateLimited:
-      description: API rate limit exceeded
+      description: API rate limit exceeded. The rate-limit middleware also returns standard rate-limit headers.
+    InternalError:
+      description: Unexpected server error; internal implementation details are not exposed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Something went wrong
   schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details:
+              nullable: true
+              description: Optional structured validation or application error details.
     LiveHealth:
       type: object
       required: [status]
