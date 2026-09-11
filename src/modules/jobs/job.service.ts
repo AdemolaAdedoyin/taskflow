@@ -3,6 +3,7 @@ import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { isValidCronExpression, nextRunFromCron } from "../../lib/cron";
+import { assertCallbackConfiguredUrl } from "../../queue/callbackDelivery";
 import { ensureJobScheduled, removeRecurringJob, cancelOnceJob } from "../../queue/jobQueue";
 import { getHandler } from "../../queue/handlers";
 import { CreateJobInput } from "./job.types";
@@ -23,6 +24,14 @@ export async function createJob(input: CreateJobInput) {
   // Fail fast if nothing is registered for this type, rather than accepting
   // a job that will error out on its very first execution.
   getHandler(input.type);
+
+  if (input.callbackUrl) {
+    try {
+      assertCallbackConfiguredUrl(input.callbackUrl);
+    } catch (error: any) {
+      throw new AppError(error?.message ?? "callbackUrl is not allowed", 422, "VALIDATION_ERROR");
+    }
+  }
 
   if (input.idempotencyKey) {
     const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
@@ -49,6 +58,7 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      callbackUrl: input.callbackUrl,
       nextRunAt: runAt,
     };
   } else {
@@ -66,6 +76,7 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      callbackUrl: input.callbackUrl,
       nextRunAt: nextRunFromCron(input.schedule.cron, timezone),
     };
   }
