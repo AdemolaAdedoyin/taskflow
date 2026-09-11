@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { config } from "../../config";
 import { prisma } from "../../db";
 import { callbackQueue } from "../../queue/callbackQueue";
 import { jobQueue } from "../../queue/jobQueue";
@@ -27,6 +28,10 @@ operationsRouter.get("/overview", requireAuth, async (_req, res, next) => {
       callbacks: {
         queue: callbackQueueCounts,
         deliveries: callbacksByStatus,
+      },
+      handlerLimits: {
+        concurrency: config.HANDLER_CONCURRENCY_LIMITS,
+        rate: config.HANDLER_RATE_LIMITS,
       },
       jobs: jobsByStatus,
     });
