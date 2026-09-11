@@ -13,7 +13,13 @@ import { reconcilePendingCallbacks } from "./reconcile";
 async function queueCompletionCallback(job: Job, execution: JobExecution) {
   if (!job.callbackUrl) return;
   try {
-    await scheduleCompletionCallback(job, execution);
+    // Finalization happens before callback scheduling. Re-read the durable job
+    // so the callback reports the status clients would observe at delivery time
+    // (SUCCEEDED/FAILED for one-off jobs, SCHEDULED/CANCELLED for recurring jobs)
+    // instead of the stale SCHEDULED/RUNNING snapshot loaded before execution.
+    const finalizedJob = await prisma.job.findUnique({ where: { id: job.id } });
+    if (!finalizedJob) return;
+    await scheduleCompletionCallback(finalizedJob, execution);
   } catch (error) {
     // Callback delivery is intentionally decoupled from the business handler.
     // A Redis outage must not turn a successfully executed job into a retry.
