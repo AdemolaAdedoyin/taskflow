@@ -25,11 +25,11 @@ async function bootstrap() {
 }
 
 async function closeDependencies() {
-  await Promise.allSettled([
-    closeCallbackQueueResources(),
-    closeQueueResources(),
-    prisma.$disconnect(),
-  ]);
+  // Both queues share one IORedis client. Close queue wrappers first, then let
+  // closeQueueResources terminate the shared connection.
+  await closeCallbackQueueResources().catch(() => undefined);
+  await closeQueueResources().catch(() => undefined);
+  await prisma.$disconnect().catch(() => undefined);
 }
 
 async function shutdown(signal: string) {
