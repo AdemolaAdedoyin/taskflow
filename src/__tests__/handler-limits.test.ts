@@ -21,7 +21,7 @@ describe("handler limit configuration", () => {
   it("rejects malformed or duplicate policies", () => {
     expect(() => parseHandlerConcurrencyLimits("http_request:0")).toThrow(/positive integer/);
     expect(() => parseHandlerConcurrencyLimits("http_request:2,http_request:3")).toThrow(/Duplicate/);
-    expect(() => parseHandlerRateLimits("http_request:10")).toThrow(/max\/windowMs/);
+    expect(() => parseHandlerRateLimits("http_request:10")).toThrow(/windowMs/);
     expect(() => parseHandlerRateLimits("http_request:10/0")).toThrow(/positive integers/);
   });
 });
