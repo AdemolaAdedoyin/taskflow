@@ -11,15 +11,16 @@ There is intentionally no frontend. The product surface is the API itself: OpenA
 ## What this project demonstrates
 
 - **Durable scheduling** — job definitions live in PostgreSQL while Redis/BullMQ is treated as rebuildable execution infrastructure.
-- **Idempotent creation and recovery** — a database uniqueness boundary prevents duplicate durable jobs, and repeat requests can repair missing queue projections.
+- **Idempotent creation and recovery** — a database uniqueness boundary prevents duplicate durable jobs, request fingerprints reject accidental key reuse for different work, and repeat requests can repair missing queue projections.
 - **One-off and recurring jobs** — deterministic delayed-job IDs plus BullMQ v5 Job Schedulers.
 - **Concurrency-safe state transitions** — first execution claims and cancellation are coordinated through durable PostgreSQL state.
+- **Crash recovery for running work** — active executions maintain durable heartbeats; stale `RUNNING` executions are failed and made schedulable again after a worker disappears.
 - **Retry audit history** — BullMQ handles retry/backoff while every actual attempt is recorded as a `JobExecution`.
 - **Scalable history** — cursor-paginated execution history avoids unbounded relation loads for long-lived recurring jobs.
 - **Distributed handler limits** — Redis-backed concurrency leases and fixed-window rate limits coordinate capacity across worker replicas without consuming retry attempts while waiting.
 - **Durable signed callbacks** — completion callbacks are persisted before enqueue, retried independently, HMAC-signed, SSRF-checked, and recoverable after Redis failures.
 - **Least-privilege API access** — named production clients use explicit `jobs.read`, `jobs.write`, and `operations.read` scopes.
-- **Security boundaries** — constant-time secret comparison, rate limits, CORS/proxy configuration, SSRF defenses, redirect blocking, and production outbound-host allowlists.
+- **Security boundaries** — constant-time secret comparison, rate limits, CORS/proxy configuration, SSRF defenses, redirect blocking, bounded outbound response reads, and production outbound-host allowlists.
 - **Operational visibility** — request IDs, structured logs, liveness/readiness, JSON operations overview, and Prometheus-compatible metrics.
 - **Production runtime model** — separate API and worker processes plus a one-off migration image target, with non-root/minimal long-lived runtime containers.
 - **Real integration coverage** — CI runs PostgreSQL and Redis, applies migrations, exercises real HTTP + queue/database coordination, audits production dependencies, builds TypeScript, and builds both migration and runtime images.
@@ -144,7 +145,7 @@ curl -X POST http://localhost:4000/v1/jobs \
   }'
 ```
 
-Repeat the request with the same `idempotencyKey`: Taskflow returns the same durable job and can repair its Redis projection if the original request committed to PostgreSQL but queueing failed.
+Repeat the same request with the same `idempotencyKey`: Taskflow returns the same durable job and can repair its Redis projection if the original request committed to PostgreSQL but queueing failed. Reusing that key for a different normalized job definition returns `409 CONFLICT`.
 
 ## Reliability and security decisions
 
@@ -152,13 +153,15 @@ Repeat the request with the same `idempotencyKey`: Taskflow returns the same dur
 
 **No fake cancellation of running work.** Taskflow returns a conflict instead of claiming an arbitrary running handler was safely pre-empted.
 
+**Running work has a durable lease.** Each `RUNNING` execution refreshes a PostgreSQL heartbeat. If a worker disappears, stale executions are marked failed and their jobs return to `SCHEDULED`; a live worker whose execution lease was recovered cannot later overwrite that recovered execution as successful.
+
 **Capacity waiting is not a business attempt.** Per-handler concurrency/rate checks happen before the durable `RUNNING` transition. A throttled job goes back to BullMQ's delayed set without burning retry budget or creating a fake execution row.
 
 **Crash-safe distributed concurrency.** Handler permits are renewable expiring Redis leases coordinated against Redis time rather than individual worker clocks.
 
 **Callbacks are a separate failure domain.** Callback intent is durable and callback retries never turn a completed business execution back into work that should run again.
 
-**Outbound networking is opt-in in production.** HTTP jobs and callbacks use SSRF checks, do not follow redirects, and require explicitly allowed production hostnames.
+**Outbound networking is opt-in in production.** HTTP jobs and callbacks use SSRF checks, do not follow redirects, require explicitly allowed production hostnames, and cap response bodies before storing/logging excerpts.
 
 **API clients are least-privilege.** Authentication identifies a named client; authorization independently checks the endpoint's required scope. Invalid credentials produce `401`; insufficient scope produces `403`.
 
@@ -172,7 +175,7 @@ Unit tests:
 npm test
 ```
 
-The CI integration path uses real PostgreSQL and Redis, applies migrations to a fresh database, verifies API authorization and durable/queue behavior, tests distributed limits, builds the TypeScript project, audits production dependencies, and builds both Docker targets.
+The CI integration path uses real PostgreSQL and Redis, applies migrations to a fresh database, verifies API authorization and durable/queue behavior, tests stale-execution recovery and distributed limits, builds the TypeScript project, audits production dependencies, and builds both Docker targets.
 
 ## Project layout
 
@@ -191,6 +194,7 @@ src/
     handlers/               # pluggable business handlers
     jobQueue.ts             # enqueue/scheduler helpers
     handlerLimits.ts        # distributed concurrency/rate coordination
+    executionLease.ts       # durable execution heartbeat + stale recovery
     callbackQueue.ts        # callback queue
     callbackDelivery.ts     # callback lifecycle/signing/delivery
     reconcile.ts            # repair queue projections
@@ -202,3 +206,13 @@ Dockerfile                  # builder, migrator, hardened runtime targets
 docker-compose.yml
 .github/workflows/ci.yml
 ```
+
+## TODO / future improvements
+
+These are intentionally left as future scale/operational improvements rather than missing portfolio fundamentals:
+
+- **Bound reconciliation work** — paginate/batch scheduled-job and pending-callback reconciliation instead of scanning a potentially large durable set at startup; add bounded parallelism with backpressure.
+- **Direct recurring-scheduler lookup** — avoid `getJobSchedulers()` + in-memory search when deriving the next recurring run at very high scheduler cardinality.
+- **Validate handler payloads at the API boundary** — evolve the handler registry to expose both a request schema and executor so malformed handler-specific payloads fail with `422` before they are scheduled, while retaining worker-side validation as defense in depth.
+- **Dependency maintenance** — upgrade deprecated `cron-parser` v4 and refresh GitHub Actions/dependency versions to clear remaining deprecation warnings and non-blocking audit findings while preserving the current production audit gate.
+- **Repository governance** — enable `main` branch protection/rulesets requiring CI before merge when repository administration settings are available.

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { config } from "../../config";
+import { readResponseTextLimited } from "../../lib/http";
 import { assertSafeHttpUrl } from "../../lib/network";
 import { JobHandler } from "./types";
 
@@ -14,9 +15,6 @@ function assertAllowedOutboundHost(target: URL) {
   const hostname = target.hostname.toLowerCase();
   const allowedHosts = new Set(config.HTTP_ALLOWED_HOSTS);
 
-  // In production, outbound HTTP is opt-in. This closes the DNS-rebinding/TOCTOU
-  // gap between our validation lookup and the HTTP client's connection lookup by
-  // limiting requests to operator-controlled hostnames rather than arbitrary DNS.
   if (config.NODE_ENV === "production" && allowedHosts.size === 0) {
     throw new Error("http_request jobs are disabled until HTTP_ALLOWED_HOSTS is configured");
   }
@@ -26,12 +24,6 @@ function assertAllowedOutboundHost(target: URL) {
   }
 }
 
-/**
- * Generic "call this endpoint" handler — useful for cache warmers, callbacks,
- * and service-to-service tasks. User-supplied targets are validated before
- * connection and redirects are disabled so a public URL cannot bounce the
- * worker into a private network.
- */
 export const httpRequestHandler: JobHandler = async (rawPayload) => {
   const payload = payloadSchema.parse(rawPayload);
   const target = await assertSafeHttpUrl(payload.url);
@@ -49,14 +41,16 @@ export const httpRequestHandler: JobHandler = async (rawPayload) => {
       redirect: "manual",
     });
 
-    const text = await res.text().catch(() => "");
     if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => undefined);
       throw new Error(`Request to ${target.toString()} returned a redirect, which Taskflow does not follow`);
     }
+
+    const text = await readResponseTextLimited(res, res.ok ? 2_000 : 300).catch(() => "");
     if (!res.ok) {
-      throw new Error(`Request to ${target.toString()} failed with HTTP ${res.status}: ${text.slice(0, 300)}`);
+      throw new Error(`Request to ${target.toString()} failed with HTTP ${res.status}: ${text}`);
     }
-    return { status: res.status, body: text.slice(0, 2000) };
+    return { status: res.status, body: text };
   } finally {
     clearTimeout(timeout);
   }

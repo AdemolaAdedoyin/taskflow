@@ -63,7 +63,7 @@ SCHEDULED -> CANCELLED
 
 Recurring jobs return to `SCHEDULED` after each completed firing so BullMQ can execute the next occurrence. A `RUNNING` job cannot be reported as cancelled because Taskflow cannot safely pre-empt arbitrary handler code.
 
-Each real handler attempt creates a durable `JobExecution` row. Waiting for a handler-level concurrency or rate-limit permit happens before the durable `RUNNING` claim, so throttling does not consume a business retry attempt.
+Each real handler attempt creates a durable `JobExecution` row. While a handler is running, the worker refreshes a durable heartbeat. If that heartbeat expires because a worker dies, recovery marks the abandoned execution failed and makes the job schedulable again so BullMQ can retry it safely. Waiting for a handler-level concurrency or rate-limit permit happens before the durable `RUNNING` claim, so throttling does not consume a business retry attempt.
 
 ## Create a one-off job
 
@@ -81,7 +81,7 @@ curl -X POST http://localhost:4000/v1/jobs \
   }'
 ```
 
-`idempotencyKey` is optional, but when supplied it is the durable duplicate boundary. Repeating the same create call returns the existing job and also repairs a missing Redis projection if the original request committed to PostgreSQL but queueing failed.
+`idempotencyKey` is optional, but when supplied it is the durable duplicate boundary. Taskflow also stores a fingerprint of the normalized job definition. Repeating the same request returns the existing job and repairs a missing Redis projection if necessary; reusing the key with a different payload, schedule, callback, priority, or retry configuration returns `409 CONFLICT` instead of silently returning unrelated work.
 
 ## Create a recurring job
 
@@ -99,6 +99,8 @@ curl -X POST http://localhost:4000/v1/jobs \
     }
   }'
 ```
+
+Cron expressions and IANA timezones are validated together. Invalid schedule/timezone combinations return `422 VALIDATION_ERROR`.
 
 ## List and inspect jobs
 
@@ -166,8 +168,8 @@ Common codes:
 | 401 | `UNAUTHORIZED` | bearer token missing or invalid |
 | 403 | `FORBIDDEN` | authenticated client lacks required scope |
 | 404 | `NOT_FOUND` | job or route does not exist |
-| 409 | `CONFLICT` | operation conflicts with current durable state |
-| 422 | `VALIDATION_ERROR` | body/query/cursor validation failed |
+| 409 | `CONFLICT` | operation conflicts with current durable state or an idempotency key was reused for different work |
+| 422 | `VALIDATION_ERROR` | body/query/cursor/schedule validation failed |
 | 429 | rate-limit response | API rate limit exceeded |
 | 500 | `INTERNAL_ERROR` | unexpected server error; internal details are not exposed |
 

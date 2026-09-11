@@ -6,6 +6,12 @@ import { logger } from "../lib/logger";
 import { CALLBACK_QUEUE_NAME, CallbackPayload, closeCallbackQueueResources } from "./callbackQueue";
 import { deliverCallback, scheduleCompletionCallback } from "./callbackDelivery";
 import { redisConnection } from "./connection";
+import {
+  ExecutionLeaseLostError,
+  finishExecution,
+  recoverStaleExecutions,
+  startExecutionHeartbeat,
+} from "./executionLease";
 import { acquireHandlerExecutionSlot } from "./handlerLimits";
 import { QUEUE_NAME, JobPayload, closeQueueResources, getNextRecurringRun } from "./jobQueue";
 import { getHandler } from "./handlers";
@@ -14,28 +20,33 @@ import { reconcilePendingCallbacks } from "./reconcile";
 async function queueCompletionCallback(job: Job, execution: JobExecution) {
   if (!job.callbackUrl) return;
   try {
-    // Finalization happens before callback scheduling. Re-read the durable job
-    // so the callback reports the status clients would observe at delivery time
-    // (SUCCEEDED/FAILED for one-off jobs, SCHEDULED/CANCELLED for recurring jobs)
-    // instead of the stale SCHEDULED/RUNNING snapshot loaded before execution.
     const finalizedJob = await prisma.job.findUnique({ where: { id: job.id } });
     if (!finalizedJob) return;
     await scheduleCompletionCallback(finalizedJob, execution);
   } catch (error) {
-    // Callback delivery is intentionally decoupled from the business handler.
-    // A Redis outage must not turn a successfully executed job into a retry.
-    // If the durable delivery row was created, startup reconciliation repairs it.
     logger.error({ err: error, jobId: job.id, executionId: execution.id }, "failed to enqueue completion callback");
   }
 }
 
-/**
- * Processes one firing of a job (one-off or one cron tick of a recurring
- * job). Retries within a single firing are handled by BullMQ itself (via the
- * `attempts` + `backoff` options set at enqueue time) — this function just
- * needs to run the handler and record what happened; throwing lets BullMQ
- * decide whether to retry or give up.
- */
+async function claimFirstAttempt(jobId: string, attemptNumber: number) {
+  let claim = await prisma.job.updateMany({
+    where: { id: jobId, status: "SCHEDULED" },
+    data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
+  });
+
+  if (claim.count === 0) {
+    const recovery = await recoverStaleExecutions(jobId);
+    if (recovery.recovered > 0) {
+      claim = await prisma.job.updateMany({
+        where: { id: jobId, status: "SCHEDULED" },
+        data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
+      });
+    }
+  }
+
+  return claim.count === 1;
+}
+
 async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
   const { jobId } = bullJob.data;
   const attemptNumber = bullJob.attemptsMade + 1;
@@ -50,9 +61,6 @@ async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
     return;
   }
 
-  // Per-handler gates run before the durable RUNNING claim. A throttled job is
-  // moved back to BullMQ's delayed set without consuming a business attempt or
-  // creating a misleading JobExecution row.
   const slot = await acquireHandlerExecutionSlot(job.type);
   if (slot.delayMs > 0) {
     if (!token) throw new Error("BullMQ worker token is required to delay a rate-limited job");
@@ -62,16 +70,8 @@ async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
 
   try {
     if (bullJob.attemptsMade === 0) {
-      // First attempts must atomically claim durable SCHEDULED state. This both
-      // prevents overlapping recurring firings and closes the race where a
-      // one-off worker could overwrite a concurrent CANCELLED transition after
-      // its initial read.
-      const claim = await prisma.job.updateMany({
-        where: { id: jobId, status: "SCHEDULED" },
-        data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
-      });
-
-      if (claim.count === 0) {
+      const claimed = await claimFirstAttempt(jobId, attemptNumber);
+      if (!claimed) {
         const latest = await prisma.job.findUnique({ where: { id: jobId }, select: { status: true } });
         logger.info(
           { jobId, status: latest?.status, scheduleType: job.scheduleType },
@@ -80,7 +80,6 @@ async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
         return;
       }
     } else {
-      // Retries belong to a firing that already owns the durable RUNNING state.
       await prisma.job.update({
         where: { id: jobId },
         data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
@@ -88,30 +87,39 @@ async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
     }
 
     const execution = await prisma.jobExecution.create({
-      data: { jobId, attemptNumber, status: "RUNNING" },
+      data: { jobId, attemptNumber, status: "RUNNING", heartbeatAt: new Date() },
     });
+    const heartbeat = startExecutionHeartbeat(execution.id);
 
     const startedAt = Date.now();
     try {
       const handler = getHandler(job.type);
       const result = await handler(job.payload, { jobId, attemptNumber });
       const durationMs = Date.now() - startedAt;
+      heartbeat.assertOwned();
 
-      const completedExecution = await prisma.jobExecution.update({
-        where: { id: execution.id },
-        data: { status: "SUCCEEDED", finishedAt: new Date(), durationMs, result: result as any },
+      const completedExecution = await finishExecution(execution.id, {
+        status: "SUCCEEDED",
+        finishedAt: new Date(),
+        durationMs,
+        result: result as any,
       });
+      heartbeat.stop();
 
       await finalizeJobAfterRun(job.id, job.scheduleType, { succeeded: true });
       await queueCompletionCallback(job, completedExecution);
       logger.info({ jobId, attemptNumber, durationMs }, "job succeeded");
     } catch (err: any) {
+      heartbeat.stop();
+      if (err instanceof ExecutionLeaseLostError) throw err;
+
       const durationMs = Date.now() - startedAt;
       const errorMessage = err?.message ?? "Unknown error";
-
-      const failedExecution = await prisma.jobExecution.update({
-        where: { id: execution.id },
-        data: { status: "FAILED", finishedAt: new Date(), durationMs, error: errorMessage },
+      const failedExecution = await finishExecution(execution.id, {
+        status: "FAILED",
+        finishedAt: new Date(),
+        durationMs,
+        error: errorMessage,
       });
 
       const isLastAttempt = attemptNumber >= job.maxAttempts;
@@ -128,7 +136,6 @@ async function processJob(bullJob: BullJob<JobPayload>, token?: string) {
         logger.info({ jobId, attemptNumber }, "job attempt failed, BullMQ will retry with backoff");
       }
 
-      // Re-throw so BullMQ's attempts/backoff configuration takes over.
       throw err;
     }
   } finally {
@@ -157,10 +164,8 @@ async function finalizeJobAfterRun(
     return;
   }
 
-  // Recurring jobs go back to SCHEDULED and wait for their next cron tick.
   const nextRunAt = await getNextRecurringRun(jobId);
   await prisma.job.updateMany({
-    // Do not resurrect a job cancelled while a handler was finishing.
     where: { id: jobId, status: { not: "CANCELLED" } },
     data: { status: "SCHEDULED", attemptCount: 0, nextRunAt },
   });
@@ -198,7 +203,6 @@ async function shutdown(signal: string) {
   forceExit.unref();
 
   try {
-    // BullMQ waits for active handlers/deliveries to settle and stops taking new work.
     await Promise.all([jobWorker.close(), callbackWorker.close()]);
     await closeCallbackQueueResources();
     await closeQueueResources();

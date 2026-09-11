@@ -90,7 +90,17 @@ describe("job.service", () => {
         payload: {},
         schedule: { type: "recurring", cron: "not a cron" },
       })
-    ).rejects.toThrow(/not a valid cron expression/);
+    ).rejects.toThrow(/not a valid recurring schedule/);
+  });
+
+  it("rejects an invalid recurring timezone as validation", async () => {
+    await expect(
+      jobService.createJob({
+        type: "log_message",
+        payload: {},
+        schedule: { type: "recurring", cron: "0 2 * * *", timezone: "Mars/Olympus_Mons" },
+      })
+    ).rejects.toMatchObject({ statusCode: 422, code: "VALIDATION_ERROR" });
   });
 
   it("creates a recurring job and schedules the durable definition", async () => {
@@ -104,27 +114,41 @@ describe("job.service", () => {
     expect(ensureJobScheduled).toHaveBeenCalledWith(job);
   });
 
-  it("repairs queue state when an idempotent retry finds an existing scheduled job", async () => {
-    const first = await jobService.createJob({
+  it("repairs queue state when the same idempotent request is retried", async () => {
+    const request = {
       type: "log_message",
       payload: { message: "once" },
-      schedule: { type: "once" },
+      schedule: { type: "once" as const },
       idempotencyKey: "order-42-notify",
-    });
+    };
 
-    const second = await jobService.createJob({
-      type: "log_message",
-      payload: { message: "once, again" },
-      schedule: { type: "once" },
-      idempotencyKey: "order-42-notify",
-    });
+    const first = await jobService.createJob(request);
+    const second = await jobService.createJob(request);
 
     expect(second.id).toBe(first.id);
     expect(ensureJobScheduled).toHaveBeenCalledTimes(2);
     expect(prisma.job.create).toHaveBeenCalledTimes(1);
   });
 
-  it("returns and repairs the winning row when concurrent idempotent creates race", async () => {
+  it("rejects reuse of an idempotency key for a different job definition", async () => {
+    await jobService.createJob({
+      type: "log_message",
+      payload: { message: "original" },
+      schedule: { type: "once" },
+      idempotencyKey: "reuse-key",
+    });
+
+    await expect(
+      jobService.createJob({
+        type: "log_message",
+        payload: { message: "different" },
+        schedule: { type: "once" },
+        idempotencyKey: "reuse-key",
+      })
+    ).rejects.toMatchObject({ statusCode: 409, code: "CONFLICT" });
+  });
+
+  it("returns and repairs a legacy winning row when concurrent idempotent creates race", async () => {
     const winner = {
       id: "job_winner",
       type: "log_message",
@@ -137,6 +161,7 @@ describe("job.service", () => {
       maxAttempts: 5,
       attemptCount: 0,
       idempotencyKey: "race-key",
+      idempotencyFingerprint: null,
       status: "SCHEDULED",
       lastError: null,
       lastRunAt: null,

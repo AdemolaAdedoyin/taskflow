@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ExecutionStatus, Job, JobStatus, ScheduleType } from "@prisma/client";
 import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
@@ -12,17 +13,62 @@ function isUniqueConstraintError(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "P2002";
 }
 
-async function returnExistingJob(existing: Job) {
-  // A previous request may have committed the durable Job row and then lost
-  // its Redis acknowledgement. Re-running the idempotent scheduling operation
-  // repairs that gap instead of merely returning a stranded SCHEDULED record.
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalize(item)])
+    );
+  }
+  return value;
+}
+
+function idempotencyFingerprint(input: CreateJobInput, priority: number, maxAttempts: number) {
+  const schedule =
+    input.schedule.type === "once"
+      ? { type: "once", runAt: input.schedule.runAt ?? null }
+      : {
+          type: "recurring",
+          cron: input.schedule.cron,
+          timezone: input.schedule.timezone ?? "UTC",
+        };
+
+  const normalized = canonicalize({
+    type: input.type,
+    payload: input.payload,
+    schedule,
+    priority,
+    maxAttempts,
+    callbackUrl: input.callbackUrl ?? null,
+  });
+
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+async function returnExistingJob(existing: Job, fingerprint: string) {
+  if (existing.idempotencyFingerprint && existing.idempotencyFingerprint !== fingerprint) {
+    throw new ConflictError("Idempotency key was already used with a different job definition");
+  }
+
   await ensureJobScheduled(existing);
   return existing;
 }
 
+const publicExecutionSelect = {
+  id: true,
+  attemptNumber: true,
+  status: true,
+  startedAt: true,
+  finishedAt: true,
+  durationMs: true,
+  result: true,
+  error: true,
+} as const;
+
 export async function createJob(input: CreateJobInput) {
-  // Fail fast if nothing is registered for this type, rather than accepting
-  // a job that will error out on its very first execution.
   getHandler(input.type);
 
   if (input.callbackUrl) {
@@ -33,15 +79,9 @@ export async function createJob(input: CreateJobInput) {
     }
   }
 
-  if (input.idempotencyKey) {
-    const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-    if (existing) {
-      return returnExistingJob(existing);
-    }
-  }
-
   const priority = input.priority ?? 0;
   const maxAttempts = input.maxAttempts ?? 5;
+  const fingerprint = idempotencyFingerprint(input, priority, maxAttempts);
 
   let data;
   if (input.schedule.type === "once") {
@@ -58,15 +98,20 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      idempotencyFingerprint: input.idempotencyKey ? fingerprint : undefined,
       callbackUrl: input.callbackUrl,
       nextRunAt: runAt,
     };
   } else {
-    if (!isValidCronExpression(input.schedule.cron)) {
-      throw new AppError(`'${input.schedule.cron}' is not a valid cron expression`, 422, "VALIDATION_ERROR");
+    const timezone = input.schedule.timezone ?? "UTC";
+    if (!isValidCronExpression(input.schedule.cron, timezone)) {
+      throw new AppError(
+        `'${input.schedule.cron}' with timezone '${timezone}' is not a valid recurring schedule`,
+        422,
+        "VALIDATION_ERROR"
+      );
     }
 
-    const timezone = input.schedule.timezone ?? "UTC";
     data = {
       type: input.type,
       payload: input.payload as any,
@@ -76,28 +121,28 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      idempotencyFingerprint: input.idempotencyKey ? fingerprint : undefined,
       callbackUrl: input.callbackUrl,
       nextRunAt: nextRunFromCron(input.schedule.cron, timezone),
     };
+  }
+
+  if (input.idempotencyKey) {
+    const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+    if (existing) return returnExistingJob(existing, fingerprint);
   }
 
   let job: Job;
   try {
     job = await prisma.job.create({ data });
   } catch (error) {
-    // The pre-read above is only an optimization. The unique index is the
-    // actual concurrency boundary: if two callers race on the same key, the
-    // loser reads the winning row and performs the same safe queue repair.
     if (input.idempotencyKey && isUniqueConstraintError(error)) {
       const winner = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-      if (winner) return returnExistingJob(winner);
+      if (winner) return returnExistingJob(winner, fingerprint);
     }
     throw error;
   }
 
-  // Postgres is the source of truth. If Redis is unavailable here, preserve
-  // the SCHEDULED row and fail the request. A retry with the same idempotency
-  // key, or startup reconciliation, can safely recreate the missing queue item.
   await ensureJobScheduled(job);
   return job;
 }
@@ -122,7 +167,13 @@ export async function listJobs(options: {
 export async function getJob(id: string) {
   const job = await prisma.job.findUnique({
     where: { id },
-    include: { executions: { orderBy: { startedAt: "desc" }, take: 20 } },
+    include: {
+      executions: {
+        orderBy: { startedAt: "desc" },
+        take: 20,
+        select: publicExecutionSelect,
+      },
+    },
   });
   if (!job) throw new NotFoundError("Job", id);
   return job;
@@ -180,6 +231,7 @@ export async function listJobExecutions(
     },
     orderBy: [{ startedAt: "desc" }, { id: "desc" }],
     take: options.limit + 1,
+    select: publicExecutionSelect,
   });
 
   const hasMore = rows.length > options.limit;
@@ -202,8 +254,6 @@ export async function cancelJob(id: string) {
     throw new ConflictError(`Job is already in a terminal state (${job.status})`);
   }
   if (job.status === "RUNNING") {
-    // Handlers are arbitrary user code and cannot be safely pre-empted. Refuse
-    // to claim cancellation succeeded while a worker may still be executing it.
     throw new ConflictError("Job is currently running and cannot be cancelled safely");
   }
 
@@ -217,8 +267,6 @@ export async function cancelJob(id: string) {
     throw new ConflictError(`Job can no longer be cancelled (${latest?.status ?? "unknown state"})`);
   }
 
-  // Postgres changes first: if Redis cleanup fails or races with a worker, the
-  // durable CANCELLED state still prevents the queued firing from executing.
   try {
     if (job.scheduleType === "ONCE") {
       await cancelOnceJob(id);

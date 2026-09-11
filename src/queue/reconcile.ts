@@ -1,9 +1,15 @@
 import { prisma } from "../db";
 import { logger } from "../lib/logger";
 import { enqueueCallbackDelivery } from "./callbackQueue";
+import { recoverStaleExecutions } from "./executionLease";
 import { ensureJobScheduled } from "./jobQueue";
 
 export async function reconcileScheduledJobs() {
+  const stale = await recoverStaleExecutions();
+  if (stale.recovered > 0) {
+    logger.warn(stale, "recovered stale RUNNING executions before queue reconciliation");
+  }
+
   const scheduledJobs = await prisma.job.findMany({
     where: { status: "SCHEDULED" },
     orderBy: { createdAt: "asc" },
@@ -23,11 +29,11 @@ export async function reconcileScheduledJobs() {
   }
 
   logger.info(
-    { checked: scheduledJobs.length, repaired, failed },
+    { checked: scheduledJobs.length, repaired, failed, staleRecovered: stale.recovered },
     "scheduled-job reconciliation completed"
   );
 
-  return { checked: scheduledJobs.length, repaired, failed };
+  return { checked: scheduledJobs.length, repaired, failed, staleRecovered: stale.recovered };
 }
 
 export async function reconcilePendingCallbacks() {
