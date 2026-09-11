@@ -214,4 +214,5 @@ These are intentionally left as future scale/operational improvements rather tha
 - **Bound reconciliation work** — paginate/batch scheduled-job and pending-callback reconciliation instead of scanning a potentially large durable set at startup; add bounded parallelism with backpressure.
 - **Direct recurring-scheduler lookup** — avoid `getJobSchedulers()` + in-memory search when deriving the next recurring run at very high scheduler cardinality.
 - **Validate handler payloads at the API boundary** — evolve the handler registry to expose both a request schema and executor so malformed handler-specific payloads fail with `422` before they are scheduled, while retaining worker-side validation as defense in depth.
+- **Dependency maintenance** — upgrade deprecated `cron-parser` v4 and refresh GitHub Actions/dependency versions to clear remaining deprecation warnings and non-blocking audit findings while preserving the current production audit gate.
 - **Repository governance** — enable `main` branch protection/rulesets requiring CI before merge when repository administration settings are available.
