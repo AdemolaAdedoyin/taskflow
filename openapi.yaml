@@ -2,22 +2,62 @@ openapi: 3.0.3
 info:
   title: Taskflow API
   description: >
-    Job scheduling and queue system. Create one-off jobs (run once, optionally
-    delayed) or recurring jobs (cron-style), with priorities, automatic
-    retries with backoff, and idempotent creation.
-  version: "1.0"
+    Durable job scheduling and queue service. PostgreSQL stores job definitions
+    and execution history while Redis/BullMQ provides delayed, recurring, and
+    retry execution.
+  version: "1.1"
 servers:
   - url: http://localhost:4000
 security:
   - bearerAuth: []
 paths:
+  /health:
+    get:
+      security: []
+      summary: Lightweight health check
+      responses:
+        "200":
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveHealth"
+  /health/live:
+    get:
+      security: []
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveHealth"
+  /health/ready:
+    get:
+      security: []
+      summary: Dependency readiness probe
+      description: Checks PostgreSQL and Redis with bounded timeouts.
+      responses:
+        "200":
+          description: Runtime dependencies are reachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessHealth"
+        "503":
+          description: One or more runtime dependencies are unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessHealth"
   /v1/jobs:
     post:
       summary: Create a job
       description: >
         Creates a one-off or recurring job. If `idempotencyKey` is provided
-        and a job with that key already exists, the existing job is returned
-        instead of creating a duplicate.
+        and a job with that key already exists, the existing durable job is
+        returned and its BullMQ projection is repaired if necessary.
       requestBody:
         required: true
         content:
@@ -26,11 +66,12 @@ paths:
               $ref: "#/components/schemas/CreateJobRequest"
             examples:
               delayedOnce:
-                summary: One-off job, run in 10 minutes
+                summary: One-off job
                 value:
-                  type: http_request
-                  payload: { url: "https://example.com/cache/warm", method: "POST" }
-                  schedule: { type: once, runAt: "2026-09-10T15:30:00Z" }
+                  type: log_message
+                  payload: { message: "run this later" }
+                  schedule: { type: once, runAt: "2026-09-12T20:00:00Z" }
+                  idempotencyKey: demo-once-1
                   maxAttempts: 3
               recurring:
                 summary: Recurring job, every day at 2am UTC
@@ -40,13 +81,17 @@ paths:
                   schedule: { type: recurring, cron: "0 2 * * *", timezone: "UTC" }
       responses:
         "201":
-          description: Job created (or the existing job, if idempotencyKey matched)
+          description: Job created, or existing idempotent job returned
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "422":
           description: Validation error
+        "429":
+          $ref: "#/components/responses/RateLimited"
     get:
       summary: List jobs
       parameters:
@@ -64,24 +109,27 @@ paths:
             enum: [ONCE, RECURRING]
         - name: limit
           in: query
-          schema: { type: integer, default: 50, maximum: 200 }
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
       responses:
         "200":
-          description: A page of jobs
+          description: Jobs ordered by creation time descending
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: Invalid filter
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /v1/jobs/{id}:
     get:
-      summary: Get a job and its recent execution history
+      summary: Get a job and recent execution history
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+        - $ref: "#/components/parameters/JobId"
       responses:
         "200":
           description: Job detail
@@ -89,19 +137,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JobDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
-          description: Not found
+          description: Job not found
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /v1/jobs/{id}/cancel:
     post:
-      summary: Cancel a scheduled or recurring job
+      summary: Cancel a scheduled job
       description: >
-        No-op error if the job is already in a terminal state. Cancelling a
-        recurring job removes its BullMQ scheduler so no future ticks fire.
+        Atomically marks a SCHEDULED job CANCELLED in PostgreSQL before best-effort
+        BullMQ cleanup. RUNNING and terminal jobs return a conflict rather than
+        reporting a cancellation that cannot be guaranteed.
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+        - $ref: "#/components/parameters/JobId"
       responses:
         "200":
           description: The cancelled job
@@ -109,15 +159,63 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Job not found
         "409":
-          description: Job already in a terminal state
+          description: Job is running or already terminal
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/operations/overview:
+    get:
+      summary: Runtime operations overview
+      description: Returns BullMQ queue counts, durable job-status counts, and process uptime.
+      responses:
+        "200":
+          description: Current runtime overview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationsOverview"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Set to the value of TASKFLOW_API_KEY
+      description: Set to the configured TASKFLOW_API_KEY value.
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+    RateLimited:
+      description: API rate limit exceeded
   schemas:
+    LiveHealth:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+    ReadinessHealth:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        checks:
+          type: object
+          required: [postgres, redis]
+          properties:
+            postgres: { type: string, enum: [ok, failed] }
+            redis: { type: string, enum: [ok, failed] }
     JobStatus:
       type: string
       enum: [SCHEDULED, RUNNING, SUCCEEDED, FAILED, CANCELLED]
@@ -136,23 +234,23 @@ components:
       properties:
         type: { type: string, enum: [recurring] }
         cron: { type: string, example: "0 2 * * *" }
-        timezone: { type: string, default: UTC, example: "America/New_York" }
+        timezone: { type: string, default: UTC, example: "America/Chicago" }
     CreateJobRequest:
       type: object
       required: [type, payload, schedule]
       properties:
         type:
           type: string
-          description: Must match a registered handler (e.g. http_request, log_message).
+          description: Must match a registered handler such as log_message, http_request, or simulate_failure.
         payload:
-          description: Handler-specific input, validated by the handler itself.
+          description: Handler-specific JSON input validated by the handler.
         schedule:
           oneOf:
             - $ref: "#/components/schemas/ScheduleOnce"
             - $ref: "#/components/schemas/ScheduleRecurring"
         priority: { type: integer, minimum: 0, maximum: 10, default: 0 }
         maxAttempts: { type: integer, minimum: 1, maximum: 20, default: 5 }
-        idempotencyKey: { type: string }
+        idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
     Job:
       type: object
       properties:
@@ -160,15 +258,20 @@ components:
         type: { type: string }
         payload: {}
         scheduleType: { type: string, enum: [ONCE, RECURRING] }
+        runAt: { type: string, format: date-time, nullable: true }
+        cronExpression: { type: string, nullable: true }
+        timezone: { type: string }
         status:
           $ref: "#/components/schemas/JobStatus"
         priority: { type: integer }
         maxAttempts: { type: integer }
         attemptCount: { type: integer }
+        idempotencyKey: { type: string, nullable: true }
         lastError: { type: string, nullable: true }
         lastRunAt: { type: string, format: date-time, nullable: true }
         nextRunAt: { type: string, format: date-time, nullable: true }
         createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
     JobExecution:
       type: object
       properties:
@@ -189,3 +292,20 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/JobExecution"
+    OperationsOverview:
+      type: object
+      required: [timestamp, process, queue, jobs]
+      properties:
+        timestamp: { type: string, format: date-time }
+        process:
+          type: object
+          properties:
+            uptimeSeconds: { type: integer, minimum: 0 }
+        queue:
+          type: object
+          additionalProperties:
+            type: integer
+        jobs:
+          type: object
+          additionalProperties:
+            type: integer
