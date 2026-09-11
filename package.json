@@ -4,6 +4,10 @@
   "private": true,
   "description": "Job scheduling and queue system: one-off delayed jobs and cron-style recurring jobs, with priorities, retries, idempotency, and a pluggable handler registry.",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "packageManager": "npm@10.9.8",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "worker:dev": "tsx watch src/queue/worker.ts",

@@ -48,11 +48,14 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Generate Prisma client
         run: npm run prisma:generate
@@ -68,3 +71,6 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Build production container
+        run: docker build -t taskflow:ci .
