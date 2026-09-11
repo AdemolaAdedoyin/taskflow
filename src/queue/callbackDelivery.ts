@@ -92,17 +92,21 @@ export async function deliverCallback(deliveryId: string, attemptNumber: number)
     where: { id: deliveryId },
     include: { job: true, execution: true },
   });
-  if (!delivery || delivery.status === "DELIVERED") return;
+  if (!delivery || delivery.status !== "PENDING") return;
 
-  const target = await assertSafeHttpUrl(delivery.url);
-  assertCallbackConfiguredUrl(target.toString());
-
-  const body = buildCallbackBody(delivery.id, delivery.job, delivery.execution);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), config.CALLBACK_TIMEOUT_MS);
   let responseStatus: number | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
 
   try {
+    // Re-check the network boundary for every attempt. DNS can change between
+    // job creation and delivery, so static allowlisting alone is not enough.
+    const target = await assertSafeHttpUrl(delivery.url);
+    assertCallbackConfiguredUrl(target.toString());
+
+    const body = buildCallbackBody(delivery.id, delivery.job, delivery.execution);
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), config.CALLBACK_TIMEOUT_MS);
+
     const response = await fetch(target, {
       method: "POST",
       headers: {
@@ -148,6 +152,6 @@ export async function deliverCallback(deliveryId: string, attemptNumber: number)
     });
     throw error;
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
   }
 }
