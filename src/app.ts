@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "fs";
 import { join } from "path";
 import express from "express";
@@ -10,7 +11,15 @@ import { config } from "./config";
 import { logger } from "./lib/logger";
 import { requireAuth } from "./middleware/auth";
 import { errorHandler } from "./middleware/errorHandler";
+import { healthRouter } from "./modules/health/health.routes";
 import { jobRouter } from "./modules/jobs/job.routes";
+import { operationsRouter } from "./modules/operations/operations.routes";
+
+function requestIdFromHeader(value: string | string[] | undefined) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(trimmed) ? trimmed : undefined;
+}
 
 export function createApp() {
   const app = express();
@@ -31,9 +40,21 @@ export function createApp() {
     })
   );
   app.use(express.json({ limit: "1mb" }));
-  app.use(pinoHttp({ logger }));
+  app.use(
+    pinoHttp({
+      logger,
+      genReqId(req, res) {
+        const requestId = requestIdFromHeader(req.headers["x-request-id"]) ?? randomUUID();
+        res.setHeader("x-request-id", requestId);
+        return requestId;
+      },
+    })
+  );
 
+  // Keep the original lightweight endpoint for compatibility while exposing
+  // explicit liveness/readiness probes for orchestrators and uptime checks.
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+  app.use("/health", healthRouter);
 
   const openapiDocument = YAML.parse(readFileSync(join(__dirname, "..", "openapi.yaml"), "utf-8"));
   app.get("/openapi.json", (_req, res) => res.json(openapiDocument));
@@ -51,6 +72,7 @@ export function createApp() {
     })
   );
   app.use("/v1/jobs", requireAuth, jobRouter);
+  app.use("/v1/operations", operationsRouter);
 
   app.use((req, res) => {
     res.status(404).json({ error: { code: "NOT_FOUND", message: `No route for ${req.method} ${req.path}` } });
