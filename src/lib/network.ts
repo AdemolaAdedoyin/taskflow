@@ -26,10 +26,9 @@ blockedAddresses.addSubnet("203.0.113.0", 24, "ipv4");
 blockedAddresses.addSubnet("224.0.0.0", 4, "ipv4");
 blockedAddresses.addSubnet("240.0.0.0", 4, "ipv4");
 
-// IPv6 loopback, private/link-local, multicast, documentation and IPv4-mapped space.
+// IPv6 loopback, private/link-local, multicast and documentation ranges.
 blockedAddresses.addAddress("::", "ipv6");
 blockedAddresses.addAddress("::1", "ipv6");
-blockedAddresses.addSubnet("::ffff:0:0", 96, "ipv6");
 blockedAddresses.addSubnet("fc00::", 7, "ipv6");
 blockedAddresses.addSubnet("fe80::", 10, "ipv6");
 blockedAddresses.addSubnet("ff00::", 8, "ipv6");
@@ -43,6 +42,13 @@ const defaultResolver: HostResolver = async (hostname) => {
 function assertPublicAddress(address: string) {
   const family = isIP(address);
   if (family === 0) throw new Error(`Resolved address '${address}' is invalid`);
+
+  // Be conservative with IPv4-mapped IPv6 addresses. Node's BlockList can
+  // normalize families in surprising ways, and mapped literals are unnecessary
+  // for Taskflow's generic outbound jobs.
+  if (family === 6 && address.toLowerCase().startsWith("::ffff:")) {
+    throw new Error("HTTP job target resolves to a private or reserved network address");
+  }
 
   const type = family === 6 ? "ipv6" : "ipv4";
   if (blockedAddresses.check(address, type)) {
