@@ -22,6 +22,15 @@ function jobOptions(priority: number, maxAttempts: number) {
   };
 }
 
+function onceQueueJobId(jobId: string) {
+  // BullMQ reserves ':' as an internal key separator, so custom ids use '-'.
+  return `once-${jobId}`;
+}
+
+function recurringSchedulerId(jobId: string) {
+  return `recurring-${jobId}`;
+}
+
 /** Enqueue a one-off job. `delayMs` defers the first attempt. */
 export async function enqueueOnceJob(
   jobId: string,
@@ -34,7 +43,7 @@ export async function enqueueOnceJob(
       // A deterministic BullMQ id makes re-enqueue attempts safe: if the API
       // retries after an ambiguous Redis/network failure, BullMQ won't create
       // a second copy of the same one-off job while the original still exists.
-      jobId: `once:${jobId}`,
+      jobId: onceQueueJobId(jobId),
       delay: opts.delayMs,
       ...jobOptions(opts.priority, opts.maxAttempts),
     }
@@ -51,7 +60,7 @@ export async function upsertRecurringJob(
   opts: { cronExpression: string; timezone: string; priority: number; maxAttempts: number }
 ) {
   await jobQueue.upsertJobScheduler(
-    `recurring:${jobId}`,
+    recurringSchedulerId(jobId),
     { pattern: opts.cronExpression, tz: opts.timezone },
     {
       name: "run",
@@ -95,12 +104,12 @@ export async function ensureJobScheduled(job: Job) {
 }
 
 export async function removeRecurringJob(jobId: string) {
-  await jobQueue.removeJobScheduler(`recurring:${jobId}`);
+  await jobQueue.removeJobScheduler(recurringSchedulerId(jobId));
 }
 
 /** Cancel a still-pending one-off job (no-op if it already started running). */
 export async function cancelOnceJob(jobId: string) {
-  const job = await jobQueue.getJob(`once:${jobId}`);
+  const job = await jobQueue.getJob(onceQueueJobId(jobId));
   if (job) {
     const state = await job.getState();
     if (state === "waiting" || state === "delayed") {
@@ -114,6 +123,6 @@ export async function cancelOnceJob(jobId: string) {
 /** Fetch the next scheduled run time for a recurring job's scheduler, if any. */
 export async function getNextRecurringRun(jobId: string): Promise<Date | null> {
   const schedulers = await jobQueue.getJobSchedulers();
-  const match = schedulers.find((s) => s.id === `recurring:${jobId}`);
+  const match = schedulers.find((s) => s.id === recurringSchedulerId(jobId));
   return match?.next ? new Date(match.next) : null;
 }
