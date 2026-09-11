@@ -39,6 +39,7 @@ jobs:
       DATABASE_URL: postgresql://taskflow:taskflow@localhost:5432/taskflow_test?schema=public
       REDIS_URL: redis://localhost:6379
       TASKFLOW_API_KEY: ci-test-key
+      TASKFLOW_API_CLIENTS: writer:writer-ci-secret:jobs.read|jobs.write,reader:reader-ci-secret:jobs.read,operator:operator-ci-secret:operations.read
       RUN_INTEGRATION_TESTS: "true"
 
     steps:
