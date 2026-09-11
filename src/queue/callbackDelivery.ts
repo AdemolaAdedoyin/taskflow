@@ -3,7 +3,6 @@ import { Job, JobExecution } from "@prisma/client";
 import { config } from "../config";
 import { prisma } from "../db";
 import { assertSafeHttpUrl } from "../lib/network";
-import { enqueueCallbackDelivery } from "./callbackQueue";
 
 function callbackHostname(rawUrl: string) {
   const target = new URL(rawUrl);
@@ -82,6 +81,9 @@ export async function scheduleCompletionCallback(job: Job, execution: JobExecuti
   });
 
   if (delivery.status === "PENDING") {
+    // Load the Redis projection only when scheduling is actually required so
+    // pure callback validation/signature unit tests stay infrastructure-free.
+    const { enqueueCallbackDelivery } = await import("./callbackQueue");
     await enqueueCallbackDelivery(delivery.id);
   }
   return delivery;
