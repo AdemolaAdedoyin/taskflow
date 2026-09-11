@@ -1,151 +1,208 @@
-# Taskflow — Job Scheduling & Queue System
+# Taskflow — Durable Job Scheduling & Queue System
 
-A backend service for running work later, or on a schedule: one-off delayed
-jobs and cron-style recurring jobs, with priorities, automatic retries with
-backoff, idempotent creation, and a pluggable handler registry. Pure API —
-no UI, documented with OpenAPI/Swagger.
+[![CI](https://github.com/AdemolaAdedoyin/taskflow/actions/workflows/ci.yml/badge.svg)](https://github.com/AdemolaAdedoyin/taskflow/actions/workflows/ci.yml)
 
-**Stack:** Node.js, TypeScript, Express, PostgreSQL (Prisma), Redis + BullMQ
-(v5 Job Schedulers).
+I built Taskflow as a backend-focused job scheduling service for work that needs to run later, retry safely, or execute on a recurring schedule. It combines PostgreSQL as the durable source of truth with Redis/BullMQ as the execution layer, and it deliberately focuses on the failure modes that make queue systems interesting: duplicate requests, partial Redis failures, cancellation races, overlapping recurring runs, retries, worker shutdown, and recovery.
 
-## Why this exists
+**Stack:** Node.js, TypeScript, Express, PostgreSQL + Prisma, Redis + BullMQ, Zod, Pino, Vitest, OpenAPI/Swagger, Docker Compose, GitHub Actions.
 
-A job/task queue is one of the most common pieces of backend infrastructure,
-and building one well touches several distinct problems:
+## Portfolio highlights
 
-- **Two scheduling models, one engine** — a one-off job (`runAt`) and a
-  recurring job (`cron`) both end up as BullMQ jobs, but recurring jobs use
-  BullMQ v5's **Job Scheduler** API (`upsertJobScheduler`) rather than manual
-  re-enqueueing, so a missed tick can't silently stop the schedule.
-- **Idempotent creation** — `POST /v1/jobs` accepts an `idempotencyKey`; a
-  retried request with the same key returns the existing job instead of
-  scheduling duplicate work, which matters a lot for anything triggered from
-  an at-least-once event system (like the companion `webhook-relay` project).
-- **Retries are the framework's job, audit trail is ours** — attempt-level
-  retry/backoff is delegated to BullMQ's native `attempts`/`backoff` options
-  (simpler than reimplementing it), while every individual attempt is still
-  recorded in Postgres as a `JobExecution` row so there's a durable history
-  independent of what's currently in Redis.
-- **Pluggable handlers** — job `type` maps to a handler function via a small
-  registry (`src/queue/handlers/index.ts`). Adding a new kind of job is
-  "write a handler, register it" — nothing else changes.
+- **Durable scheduling model** — job definitions live in PostgreSQL; Redis/BullMQ is treated as rebuildable execution infrastructure.
+- **Idempotent creation and repair** — an `idempotencyKey` prevents duplicate durable jobs, and retries can repair a missing Redis projection after an ambiguous queue failure.
+- **One-off + recurring scheduling** — delayed jobs use deterministic BullMQ IDs; recurring jobs use BullMQ v5 Job Schedulers.
+- **Concurrency-safe execution** — first attempts atomically claim `SCHEDULED` jobs in PostgreSQL so cancellation and overlapping recurring ticks cannot both win.
+- **Retry audit trail** — BullMQ owns retry/backoff mechanics while every attempt is persisted as a `JobExecution` row.
+- **Security boundaries** — bearer-token authentication, configurable rate limits/CORS/proxy handling, SSRF defenses, redirect blocking, and production outbound-host allowlisting for `http_request` jobs.
+- **Operational visibility** — request IDs, structured logs, liveness/readiness probes, queue counts, durable status counts, and process uptime.
+- **Real integration coverage** — CI starts PostgreSQL and Redis, applies migrations, exercises the HTTP API, verifies durable rows and queue projections, then builds the TypeScript project.
 
 ## Architecture
 
-```
- POST /v1/jobs               ┌──────────────┐
- ────────────────────────────▶│ API (Express) │── INSERT Job
-                              └──────┬───────┘
-                                     │ once: enqueue with delay
-                                     │ recurring: upsertJobScheduler(cron)
-                                     ▼
-                              ┌──────────────┐
-                              │ Redis (BullMQ)│
-                              └──────┬───────┘
-                                     │ fires on schedule
-                                     ▼
-                              ┌──────────────┐      handlerRegistry[type]
-                              │  Job Worker   │ ───────────────────────────▶ handler(payload)
-                              └──────┬───────┘
-                                     │ record attempt
-                                     ▼
-                              ┌──────────────┐
-                              │  PostgreSQL   │  Job + JobExecution history
-                              └──────────────┘
+```mermaid
+flowchart LR
+    Client[API client] -->|POST /v1/jobs| API[Express API]
+    API -->|create durable Job| PG[(PostgreSQL)]
+    API -->|enqueue / upsert scheduler| Redis[(Redis / BullMQ)]
+    Redis --> Worker[BullMQ Worker]
+    Worker -->|atomic claim + status| PG
+    Worker --> Handler[Handler registry]
+    Handler -->|result / error| Worker
+    Worker -->|JobExecution audit row| PG
+    API -->|health + operations| Ops[Health / Operations endpoints]
+    Ops --> PG
+    Ops --> Redis
 ```
 
-## Project structure
+The important design choice is that PostgreSQL owns durable state. If Redis is unavailable immediately after a job is created, the `SCHEDULED` row remains recoverable. An idempotent retry or startup reconciliation can safely recreate the queue entry.
 
+## Scheduling and execution flow
+
+1. `POST /v1/jobs` validates the handler type and schedule.
+2. Taskflow creates the durable PostgreSQL `Job` row.
+3. It projects that job into BullMQ using a deterministic one-off ID or a recurring Job Scheduler.
+4. A worker atomically claims the durable job before executing the handler.
+5. Every attempt is recorded as a `JobExecution` with timing, result, or error details.
+6. One-off jobs become `SUCCEEDED` or `FAILED`; recurring jobs return to `SCHEDULED` for the next tick unless cancelled.
+
+## Built-in handlers
+
+`log_message` writes a structured log message and is useful for smoke tests. `simulate_failure` deterministically fails a configured number of times before succeeding so retry/backoff behavior can be demonstrated without relying on a flaky external service. `http_request` performs outbound HTTP work, but production use is intentionally restricted: targets must pass SSRF validation and match `HTTP_ALLOWED_HOSTS`; redirects are disabled.
+
+## API
+
+The OpenAPI document is served at `/openapi.json`, with interactive Swagger UI at `/docs`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/jobs` | Create a one-off or recurring job |
+| `GET /v1/jobs` | Filter/list jobs |
+| `GET /v1/jobs/:id` | Job detail + recent execution history |
+| `POST /v1/jobs/:id/cancel` | Cancel a scheduled job safely |
+| `GET /v1/operations/overview` | Authenticated queue + durable-state overview |
+| `GET /health/live` | Process liveness |
+| `GET /health/ready` | PostgreSQL + Redis readiness |
+| `GET /health` | Backward-compatible lightweight health endpoint |
+
+Authenticated endpoints require:
+
+```text
+Authorization: Bearer <TASKFLOW_API_KEY>
 ```
-src/
-  modules/jobs/         # routes.ts (HTTP + validation) + service.ts (business logic)
-  queue/
-    jobQueue.ts          # enqueue helpers (once vs. recurring via Job Schedulers)
-    worker.ts            # executes jobs, records JobExecution rows
-    handlers/            # the extensibility point — one file per job type
-  lib/                   # cron validation, errors, logging
-  middleware/            # bearer-token auth, centralized error handling
-  __tests__/              # vitest: cron validation, handler registry, service logic
-prisma/schema.prisma     # Job, JobExecution
-openapi.yaml             # served at /docs via Swagger UI
-```
 
-## Running it locally
+Every request gets an `x-request-id`. A valid incoming ID is preserved; otherwise Taskflow generates one and returns it in the response.
 
-**With Docker (recommended):**
+## Run locally
+
+### Docker Compose
 
 ```bash
 TASKFLOW_API_KEY=$(openssl rand -hex 24) docker compose up --build
 ```
 
-API on http://localhost:4000, interactive docs at http://localhost:4000/docs.
+The API is available at `http://localhost:4000` and Swagger UI at `http://localhost:4000/docs`.
 
-**Without Docker**, with local Postgres + Redis:
+### Local Node processes
 
 ```bash
-cp .env.example .env       # set DATABASE_URL, REDIS_URL, TASKFLOW_API_KEY
+cp .env.example .env
 npm install
-npx prisma migrate dev
-npm run dev                 # API on :4000
-npm run worker:dev          # in a second terminal
+npm run prisma:generate
+npm run prisma:migrate
+npm run dev
 ```
 
+In a second terminal:
+
 ```bash
-# populate a few example jobs
+npm run worker:dev
+```
+
+Optional example jobs:
+
+```bash
 TASKFLOW_API_KEY=<your key> npm run seed
 ```
 
-## Trying it via the API
+## Example requests
+
+Create a one-off job:
 
 ```bash
-# A job that runs in 5 minutes
 curl -X POST http://localhost:4000/v1/jobs \
   -H "Authorization: Bearer <your key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "http_request",
-    "payload": { "url": "https://example.com/cache/warm", "method": "POST" },
-    "schedule": { "type": "once", "runAt": "2026-09-11T20:00:00Z" },
+    "type": "log_message",
+    "payload": { "message": "run this later" },
+    "schedule": { "type": "once", "runAt": "2026-09-12T20:00:00Z" },
+    "idempotencyKey": "demo-once-1",
     "maxAttempts": 3
   }'
+```
 
-# A recurring job, every day at 2am UTC
+Create a recurring job:
+
+```bash
 curl -X POST http://localhost:4000/v1/jobs \
   -H "Authorization: Bearer <your key>" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "log_message",
     "payload": { "message": "nightly cleanup" },
-    "schedule": { "type": "recurring", "cron": "0 2 * * *" }
+    "schedule": { "type": "recurring", "cron": "0 2 * * *", "timezone": "UTC" }
   }'
-
-# Check status + execution history
-curl -H "Authorization: Bearer <your key>" http://localhost:4000/v1/jobs/<job-id>
 ```
 
-Built-in job types: `http_request` (call any URL), `log_message` (writes a
-structured log line — good for smoke-testing), and `simulate_failure`
-(deterministically fails N times before succeeding, useful for demonstrating
-retry/backoff without a flaky real dependency).
+Inspect job state and recent attempts:
 
-## Tests
+```bash
+curl -H "Authorization: Bearer <your key>" \
+  http://localhost:4000/v1/jobs/<job-id>
+```
+
+## Configuration
+
+The main production-facing settings are documented in `.env.example`:
+
+- `DATABASE_URL` / `REDIS_URL` — durable and queue infrastructure.
+- `TASKFLOW_API_KEY` — shared bearer token; production requires at least 32 characters.
+- `JOB_CONCURRENCY` — worker concurrency.
+- `CORS_ORIGINS` — explicit browser-origin allowlist.
+- `HTTP_ALLOWED_HOSTS` — exact production allowlist for outbound HTTP jobs; an empty list disables them in production.
+- `API_RATE_LIMIT_REQUESTS` / `API_RATE_LIMIT_WINDOW_MS` — API abuse protection.
+- `TRUST_PROXY_HOPS` — set only behind a trusted reverse proxy.
+
+## Testing and CI
+
+Normal local unit tests do not require infrastructure:
 
 ```bash
 npm test
 ```
 
-Covers cron expression validation, handler resolution, and job creation
-logic (once vs. recurring, idempotency, invalid handler/cron rejection)
-against a mocked Prisma client and mocked queue.
+For the real runtime integration suite, start PostgreSQL + Redis with the configured URLs and run:
 
-## What I'd add with more time
+```bash
+RUN_INTEGRATION_TESTS=true npm test
+```
 
-- Webhooks/callbacks on job completion, so callers don't have to poll
-  `GET /v1/jobs/:id`
-- A `/v1/jobs/:id/executions` endpoint with pagination, for jobs with long
-  execution histories
-- Per-type concurrency limits (e.g. cap `http_request` jobs separately from
-  `log_message` jobs) using BullMQ's group/rate-limit features
-- A small admin UI — deliberately left as a pure API here to demonstrate
-  OpenAPI-first design, but the same dashboard pattern from `webhook-relay`
-  would drop in cleanly
+GitHub Actions automatically runs the full path on every PR: dependency install, Prisma generation/schema validation, migrations against a fresh PostgreSQL instance, unit + Postgres/Redis integration tests, and the TypeScript build.
+
+## Reliability decisions
+
+**Postgres before Redis.** Creating a job writes the durable definition first. If the queue write fails, the durable row is intentionally preserved so the operation can be repaired.
+
+**Durable cancellation before queue cleanup.** Cancellation atomically changes `SCHEDULED -> CANCELLED` in PostgreSQL before attempting Redis cleanup. Even if cleanup fails, the worker cannot legitimately claim the job afterward.
+
+**No fake cancellation of active handlers.** Arbitrary handler code cannot be safely pre-empted, so Taskflow returns a conflict instead of claiming that a `RUNNING` job was cancelled.
+
+**Graceful shutdown.** The API stops accepting traffic before closing queue/Redis/Postgres resources; the worker stops taking new work and waits for active handlers before disconnecting dependencies.
+
+## Project layout
+
+```text
+src/
+  modules/
+    jobs/                 # HTTP validation + job service
+    health/               # liveness/readiness
+    operations/           # authenticated runtime overview
+  queue/
+    jobQueue.ts           # deterministic enqueue / scheduler helpers
+    reconcile.ts          # rebuild missing queue projections
+    worker.ts             # claim, execute, persist attempts, graceful shutdown
+    handlers/             # pluggable job implementations
+  lib/                    # cron, networking/SSRF protection, logging, errors
+  middleware/             # auth + centralized error handling
+  __tests__/
+    integration/          # real Postgres + Redis runtime coverage
+prisma/
+  schema.prisma
+  migrations/
+openapi.yaml
+.github/workflows/ci.yml
+```
+
+## Next steps
+
+I would extend Taskflow next with paginated execution-history endpoints, callback/webhook delivery on job completion, per-handler concurrency/rate limits, stronger multi-client authentication/authorization, metrics export for Prometheus/OpenTelemetry, and a production deployment example using managed PostgreSQL and Redis.
