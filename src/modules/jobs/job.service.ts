@@ -1,6 +1,7 @@
 import { Job, JobStatus, ScheduleType } from "@prisma/client";
 import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
+import { logger } from "../../lib/logger";
 import { isValidCronExpression, nextRunFromCron } from "../../lib/cron";
 import { ensureJobScheduled, removeRecurringJob, cancelOnceJob } from "../../queue/jobQueue";
 import { getHandler } from "../../queue/handlers";
@@ -122,12 +123,35 @@ export async function cancelJob(id: string) {
   if (job.status === "CANCELLED" || job.status === "SUCCEEDED" || job.status === "FAILED") {
     throw new ConflictError(`Job is already in a terminal state (${job.status})`);
   }
-
-  if (job.scheduleType === "ONCE") {
-    await cancelOnceJob(id);
-  } else {
-    await removeRecurringJob(id);
+  if (job.status === "RUNNING") {
+    // Handlers are arbitrary user code and cannot be safely pre-empted. Refuse
+    // to claim cancellation succeeded while a worker may still be executing it.
+    throw new ConflictError("Job is currently running and cannot be cancelled safely");
   }
 
-  return prisma.job.update({ where: { id }, data: { status: "CANCELLED", nextRunAt: null } });
+  const cancelled = await prisma.job.updateMany({
+    where: { id, status: "SCHEDULED" },
+    data: { status: "CANCELLED", nextRunAt: null },
+  });
+
+  if (cancelled.count === 0) {
+    const latest = await prisma.job.findUnique({ where: { id } });
+    throw new ConflictError(`Job can no longer be cancelled (${latest?.status ?? "unknown state"})`);
+  }
+
+  // Postgres changes first: if Redis cleanup fails or races with a worker, the
+  // durable CANCELLED state still prevents the queued firing from executing.
+  try {
+    if (job.scheduleType === "ONCE") {
+      await cancelOnceJob(id);
+    } else {
+      await removeRecurringJob(id);
+    }
+  } catch (error) {
+    logger.warn({ err: error, jobId: id }, "queue cleanup failed after durable cancellation");
+  }
+
+  const result = await prisma.job.findUnique({ where: { id } });
+  if (!result) throw new NotFoundError("Job", id);
+  return result;
 }
