@@ -10,6 +10,22 @@ const payloadSchema = z.object({
   body: z.unknown().optional(),
 });
 
+function assertAllowedOutboundHost(target: URL) {
+  const hostname = target.hostname.toLowerCase();
+  const allowedHosts = new Set(config.HTTP_ALLOWED_HOSTS);
+
+  // In production, outbound HTTP is opt-in. This closes the DNS-rebinding/TOCTOU
+  // gap between our validation lookup and the HTTP client's connection lookup by
+  // limiting requests to operator-controlled hostnames rather than arbitrary DNS.
+  if (config.NODE_ENV === "production" && allowedHosts.size === 0) {
+    throw new Error("http_request jobs are disabled until HTTP_ALLOWED_HOSTS is configured");
+  }
+
+  if (allowedHosts.size > 0 && !allowedHosts.has(hostname)) {
+    throw new Error(`HTTP job target hostname '${hostname}' is not in HTTP_ALLOWED_HOSTS`);
+  }
+}
+
 /**
  * Generic "call this endpoint" handler — useful for cache warmers, callbacks,
  * and service-to-service tasks. User-supplied targets are validated before
@@ -19,6 +35,7 @@ const payloadSchema = z.object({
 export const httpRequestHandler: JobHandler = async (rawPayload) => {
   const payload = payloadSchema.parse(rawPayload);
   const target = await assertSafeHttpUrl(payload.url);
+  assertAllowedOutboundHost(target);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.JOB_DEFAULT_TIMEOUT_MS);
