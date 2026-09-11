@@ -14,6 +14,10 @@ const envSchema = z.object({
     .string()
     .default("")
     .transform((value) => value.split(",").map((origin) => origin.trim()).filter(Boolean)),
+  HTTP_ALLOWED_HOSTS: z
+    .string()
+    .default("")
+    .transform((value) => value.split(",").map((host) => host.trim().toLowerCase()).filter(Boolean)),
   API_RATE_LIMIT_REQUESTS: z.coerce.number().int().positive().default(600),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(0),
