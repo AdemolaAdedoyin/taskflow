@@ -3,7 +3,7 @@ import { prisma } from "../db";
 import { config } from "../config";
 import { logger } from "../lib/logger";
 import { redisConnection } from "./connection";
-import { QUEUE_NAME, JobPayload, getNextRecurringRun } from "./jobQueue";
+import { QUEUE_NAME, JobPayload, closeQueueResources, getNextRecurringRun } from "./jobQueue";
 import { getHandler } from "./handlers";
 
 /**
@@ -27,10 +27,26 @@ async function processJob(bullJob: BullJob<JobPayload>) {
     return;
   }
 
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
-  });
+  if (job.scheduleType === "RECURRING" && bullJob.attemptsMade === 0) {
+    // A recurring cron tick can arrive while the previous tick is still
+    // running. Claim the durable definition atomically so only one first
+    // attempt runs at a time across all worker processes.
+    const claim = await prisma.job.updateMany({
+      where: { id: jobId, status: "SCHEDULED" },
+      data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
+    });
+
+    if (claim.count === 0) {
+      const latest = await prisma.job.findUnique({ where: { id: jobId }, select: { status: true } });
+      logger.info({ jobId, status: latest?.status }, "skipping overlapping recurring firing");
+      return;
+    }
+  } else {
+    await prisma.job.update({
+      where: { id: jobId },
+      data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
+    });
+  }
 
   const execution = await prisma.jobExecution.create({
     data: { jobId, attemptNumber, status: "RUNNING" },
@@ -91,8 +107,9 @@ async function finalizeJobAfterRun(
 
   // Recurring jobs go back to SCHEDULED and wait for their next cron tick.
   const nextRunAt = await getNextRecurringRun(jobId);
-  await prisma.job.update({
-    where: { id: jobId },
+  await prisma.job.updateMany({
+    // Do not resurrect a job cancelled while a handler was finishing.
+    where: { id: jobId, status: { not: "CANCELLED" } },
     data: { status: "SCHEDULED", attemptCount: 0, nextRunAt },
   });
 }
@@ -105,5 +122,31 @@ export const jobWorker = new Worker<JobPayload>(QUEUE_NAME, processJob, {
 jobWorker.on("error", (err) => {
   logger.error({ err }, "worker-level error (e.g. Redis connection issue)");
 });
+
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "worker shutdown requested");
+
+  const forceExit = setTimeout(() => process.exit(1), 15_000);
+  forceExit.unref();
+
+  try {
+    // BullMQ waits for active handlers to settle and stops taking new work.
+    await jobWorker.close();
+    await closeQueueResources();
+    await prisma.$disconnect();
+    clearTimeout(forceExit);
+    logger.info("taskflow worker stopped cleanly");
+    process.exit(0);
+  } catch (error) {
+    logger.error({ err: error }, "worker shutdown failed");
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 logger.info("taskflow worker started");
