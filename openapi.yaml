@@ -8,7 +8,7 @@ info:
     callers authenticate as named clients with least-privilege scopes. Every HTTP
     response includes an x-request-id for correlation. See docs/API_GUIDE.md for
     lifecycle, error, pagination, callback, and operational semantics.
-  version: "1.5"
+  version: "1.6"
 servers:
   - url: http://localhost:4000
 security:
@@ -103,10 +103,12 @@ paths:
       summary: Create a job
       description: >
         Requires `jobs.write`. Creates a one-off or recurring job. If
-        `idempotencyKey` is provided and a job with that key already exists, the
-        existing durable job is returned and its BullMQ projection is repaired if
-        necessary. An optional `callbackUrl` requests a signed asynchronous
-        notification after each completed firing (success or final failed attempt).
+        `idempotencyKey` is provided and the same normalized job definition was
+        already accepted, the existing durable job is returned and its BullMQ
+        projection is repaired if necessary. Reusing that key for a different
+        job definition returns `409 CONFLICT`. An optional `callbackUrl` requests
+        a signed asynchronous notification after each completed firing (success
+        or final failed attempt).
       requestBody:
         required: true
         content:
@@ -176,7 +178,7 @@ paths:
                   description: Callback accepted with no response body
       responses:
         "201":
-          description: Job created, or existing idempotent job returned
+          description: Job created, or existing equivalent idempotent job returned
           content:
             application/json:
               schema:
@@ -185,6 +187,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/Validation"
         "429":
@@ -385,15 +389,22 @@ components:
               code: NOT_FOUND
               message: Job 'example-id' not found
     Conflict:
-      description: Operation conflicts with current durable state
+      description: Operation conflicts with current durable state or idempotency-key semantics
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: CONFLICT
-              message: Job cannot be cancelled from its current state
+          examples:
+            stateConflict:
+              value:
+                error:
+                  code: CONFLICT
+                  message: Job cannot be cancelled from its current state
+            idempotencyConflict:
+              value:
+                error:
+                  code: CONFLICT
+                  message: Idempotency key was already used with a different job definition
     Validation:
       description: Request body, query, cursor, schedule, or destination failed validation
       content:
@@ -494,7 +505,11 @@ components:
             - $ref: "#/components/schemas/ScheduleRecurring"
         priority: { type: integer, minimum: 0, maximum: 10, default: 0 }
         maxAttempts: { type: integer, minimum: 1, maximum: 20, default: 5 }
-        idempotencyKey: { type: string, minLength: 1, maxLength: 200 }
+        idempotencyKey:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Reuse only for the same normalized job definition; different work with the same key returns 409.
         callbackUrl:
           type: string
           format: uri
