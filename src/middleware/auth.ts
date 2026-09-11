@@ -9,6 +9,23 @@ export interface AuthPrincipal {
   scopes: ApiScope[];
 }
 
+export function assertApiAuthConfiguration() {
+  if (config.NODE_ENV === "production") {
+    if (config.TASKFLOW_API_CLIENTS.length === 0) {
+      throw new Error("TASKFLOW_API_CLIENTS must define at least one scoped API client in production");
+    }
+    const weakClient = config.TASKFLOW_API_CLIENTS.find((client) => client.secret.length < 32);
+    if (weakClient) {
+      throw new Error(`API client '${weakClient.id}' must use a secret of at least 32 characters in production`);
+    }
+    return;
+  }
+
+  if (config.TASKFLOW_API_CLIENTS.length === 0 && !config.LEGACY_API_KEY) {
+    throw new Error("Configure TASKFLOW_API_CLIENTS or TASKFLOW_API_KEY before starting the API");
+  }
+}
+
 function secureTokenEquals(candidate: string, expected: string) {
   // Hash both values first so timingSafeEqual always compares equal-length
   // buffers and does not leak token length through an early string mismatch.
