@@ -25,10 +25,22 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      target: migrator
+    command: npm run prisma:deploy
+    environment:
+      DATABASE_URL: postgresql://taskflow:taskflow@postgres:5432/taskflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build: .
     init: true
-    command: sh -c "npm run prisma:deploy && node dist/index.js"
+    command: node dist/index.js
     ports:
       - "4000:4000"
     environment:
@@ -51,8 +63,8 @@ services:
       start_period: 10s
       retries: 3
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -67,8 +79,8 @@ services:
       TASKFLOW_API_CLIENTS: ${TASKFLOW_API_CLIENTS:-local:dev-local-client-secret:*}
       TASKFLOW_API_KEY: ${TASKFLOW_API_KEY:-dev-local-key}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 

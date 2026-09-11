@@ -14,6 +14,7 @@ import { errorHandler } from "./middleware/errorHandler";
 import { authRouter } from "./modules/auth/auth.routes";
 import { healthRouter } from "./modules/health/health.routes";
 import { jobRouter } from "./modules/jobs/job.routes";
+import { metricsRouter } from "./modules/metrics/metrics.routes";
 import { operationsRouter } from "./modules/operations/operations.routes";
 
 function requestIdFromHeader(value: string | string[] | undefined) {
@@ -61,6 +62,11 @@ export function createApp() {
   const openapiDocument = YAML.parse(readFileSync(join(__dirname, "..", "openapi.yaml"), "utf-8"));
   app.get("/openapi.json", (_req, res) => res.json(openapiDocument));
   app.use("/docs", swaggerUi.serve, swaggerUi.setup(openapiDocument));
+
+  // Prometheus-compatible metrics stay outside the normal API rate limiter so
+  // a trusted scraper can poll on a fixed cadence. They still require a named
+  // client with operations.read permission.
+  app.use("/metrics", requireAuth, metricsRouter);
 
   // Rate-limit before auth so invalid credentials cannot bypass abuse controls.
   // Once authenticated, every /v1 route receives a client identity and scopes.
