@@ -70,28 +70,10 @@ try {
   process.exit(1);
 }
 
-if (parsed.data.NODE_ENV === "production") {
-  if (apiClients.length === 0) {
-    console.error("Invalid environment configuration:");
-    console.error({ TASKFLOW_API_CLIENTS: ["At least one scoped API client is required in production"] });
-    process.exit(1);
-  }
-  const weakClient = apiClients.find((client) => client.secret.length < 32);
-  if (weakClient) {
-    console.error("Invalid environment configuration:");
-    console.error({
-      TASKFLOW_API_CLIENTS: [`API client '${weakClient.id}' must use a secret of at least 32 characters in production`],
-    });
-    process.exit(1);
-  }
-}
-
+// The worker process shares this config module but does not serve the HTTP API,
+// so it should not need API-client secrets just to execute jobs. The API process
+// validates authentication requirements when createApp() is constructed.
 const legacyApiKey = parsed.data.NODE_ENV === "production" ? "" : parsed.data.TASKFLOW_API_KEY;
-if (apiClients.length === 0 && !legacyApiKey) {
-  console.error("Invalid environment configuration:");
-  console.error({ TASKFLOW_API_CLIENTS: ["Configure TASKFLOW_API_CLIENTS or TASKFLOW_API_KEY"] });
-  process.exit(1);
-}
 
 export const config = {
   ...parsed.data,
