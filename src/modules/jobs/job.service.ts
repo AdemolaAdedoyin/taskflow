@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ExecutionStatus, Job, JobStatus, ScheduleType } from "@prisma/client";
 import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
@@ -12,7 +13,48 @@ function isUniqueConstraintError(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "P2002";
 }
 
-async function returnExistingJob(existing: Job) {
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalize(item)])
+    );
+  }
+  return value;
+}
+
+function idempotencyFingerprint(input: CreateJobInput, priority: number, maxAttempts: number) {
+  const schedule =
+    input.schedule.type === "once"
+      ? { type: "once", runAt: input.schedule.runAt ?? null }
+      : {
+          type: "recurring",
+          cron: input.schedule.cron,
+          timezone: input.schedule.timezone ?? "UTC",
+        };
+
+  const normalized = canonicalize({
+    type: input.type,
+    payload: input.payload,
+    schedule,
+    priority,
+    maxAttempts,
+    callbackUrl: input.callbackUrl ?? null,
+  });
+
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+async function returnExistingJob(existing: Job, fingerprint: string) {
+  // Rows created before request fingerprints were introduced remain compatible,
+  // but all new idempotency keys are bound to one normalized job definition.
+  if (existing.idempotencyFingerprint && existing.idempotencyFingerprint !== fingerprint) {
+    throw new ConflictError("Idempotency key was already used with a different job definition");
+  }
+
   // A previous request may have committed the durable Job row and then lost
   // its Redis acknowledgement. Re-running the idempotent scheduling operation
   // repairs that gap instead of merely returning a stranded SCHEDULED record.
@@ -33,15 +75,9 @@ export async function createJob(input: CreateJobInput) {
     }
   }
 
-  if (input.idempotencyKey) {
-    const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-    if (existing) {
-      return returnExistingJob(existing);
-    }
-  }
-
   const priority = input.priority ?? 0;
   const maxAttempts = input.maxAttempts ?? 5;
+  const fingerprint = idempotencyFingerprint(input, priority, maxAttempts);
 
   let data;
   if (input.schedule.type === "once") {
@@ -58,15 +94,20 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      idempotencyFingerprint: input.idempotencyKey ? fingerprint : undefined,
       callbackUrl: input.callbackUrl,
       nextRunAt: runAt,
     };
   } else {
-    if (!isValidCronExpression(input.schedule.cron)) {
-      throw new AppError(`'${input.schedule.cron}' is not a valid cron expression`, 422, "VALIDATION_ERROR");
+    const timezone = input.schedule.timezone ?? "UTC";
+    if (!isValidCronExpression(input.schedule.cron, timezone)) {
+      throw new AppError(
+        `'${input.schedule.cron}' with timezone '${timezone}' is not a valid recurring schedule`,
+        422,
+        "VALIDATION_ERROR"
+      );
     }
 
-    const timezone = input.schedule.timezone ?? "UTC";
     data = {
       type: input.type,
       payload: input.payload as any,
@@ -76,9 +117,17 @@ export async function createJob(input: CreateJobInput) {
       priority,
       maxAttempts,
       idempotencyKey: input.idempotencyKey,
+      idempotencyFingerprint: input.idempotencyKey ? fingerprint : undefined,
       callbackUrl: input.callbackUrl,
       nextRunAt: nextRunFromCron(input.schedule.cron, timezone),
     };
+  }
+
+  if (input.idempotencyKey) {
+    const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+    if (existing) {
+      return returnExistingJob(existing, fingerprint);
+    }
   }
 
   let job: Job;
@@ -90,7 +139,7 @@ export async function createJob(input: CreateJobInput) {
     // loser reads the winning row and performs the same safe queue repair.
     if (input.idempotencyKey && isUniqueConstraintError(error)) {
       const winner = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-      if (winner) return returnExistingJob(winner);
+      if (winner) return returnExistingJob(winner, fingerprint);
     }
     throw error;
   }
