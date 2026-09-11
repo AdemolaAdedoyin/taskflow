@@ -2,10 +2,12 @@ import { createApp } from "./app";
 import { config } from "./config";
 import { logger } from "./lib/logger";
 import { prisma } from "./db";
+import { closeQueueResources } from "./queue/jobQueue";
 import { reconcileScheduledJobs } from "./queue/reconcile";
 
 const app = createApp();
 let server: ReturnType<typeof app.listen> | undefined;
+let shuttingDown = false;
 
 async function bootstrap() {
   try {
@@ -22,22 +24,32 @@ async function bootstrap() {
   });
 }
 
+async function closeDependencies() {
+  await Promise.allSettled([closeQueueResources(), prisma.$disconnect()]);
+}
+
 async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   logger.info(`received ${signal}, shutting down gracefully`);
 
+  const forceExit = setTimeout(() => process.exit(1), 10_000);
+  forceExit.unref();
+
   if (!server) {
-    await prisma.$disconnect();
+    await closeDependencies();
+    clearTimeout(forceExit);
     process.exit(0);
   }
 
   server.close(async () => {
-    await prisma.$disconnect();
+    await closeDependencies();
+    clearTimeout(forceExit);
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 10_000).unref();
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
 
 void bootstrap();
