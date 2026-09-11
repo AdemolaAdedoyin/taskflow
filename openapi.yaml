@@ -5,7 +5,7 @@ info:
     Durable job scheduling and queue service. PostgreSQL stores job definitions
     and execution history while Redis/BullMQ provides delayed, recurring, and
     retry execution.
-  version: "1.1"
+  version: "1.2"
 servers:
   - url: http://localhost:4000
 security:
@@ -128,6 +128,7 @@ paths:
   /v1/jobs/{id}:
     get:
       summary: Get a job and recent execution history
+      description: Includes the 20 most recent executions for convenience. Use the executions endpoint for full history.
       parameters:
         - $ref: "#/components/parameters/JobId"
       responses:
@@ -141,6 +142,40 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           description: Job not found
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/jobs/{id}/executions:
+    get:
+      summary: List job execution history
+      description: >
+        Returns execution attempts newest first using opaque cursor pagination.
+        Supply the previous response's `pageInfo.nextCursor` to continue.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/ExecutionStatus"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: cursor
+          in: query
+          description: Opaque cursor returned by the previous page.
+          schema: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: Cursor-paginated execution history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Job not found
+        "422":
+          description: Invalid status, limit, or cursor
         "429":
           $ref: "#/components/responses/RateLimited"
   /v1/jobs/{id}/cancel:
@@ -219,6 +254,9 @@ components:
     JobStatus:
       type: string
       enum: [SCHEDULED, RUNNING, SUCCEEDED, FAILED, CANCELLED]
+    ExecutionStatus:
+      type: string
+      enum: [RUNNING, SUCCEEDED, FAILED]
     ScheduleOnce:
       type: object
       required: [type]
@@ -277,12 +315,27 @@ components:
       properties:
         id: { type: string }
         attemptNumber: { type: integer }
-        status: { type: string, enum: [RUNNING, SUCCEEDED, FAILED] }
+        status:
+          $ref: "#/components/schemas/ExecutionStatus"
         startedAt: { type: string, format: date-time }
         finishedAt: { type: string, format: date-time, nullable: true }
         durationMs: { type: integer, nullable: true }
         result: { nullable: true }
         error: { type: string, nullable: true }
+    ExecutionPage:
+      type: object
+      required: [data, pageInfo]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobExecution"
+        pageInfo:
+          type: object
+          required: [nextCursor, hasMore]
+          properties:
+            nextCursor: { type: string, nullable: true }
+            hasMore: { type: boolean }
     JobDetail:
       allOf:
         - $ref: "#/components/schemas/Job"
@@ -290,6 +343,7 @@ components:
           properties:
             executions:
               type: array
+              maxItems: 20
               items:
                 $ref: "#/components/schemas/JobExecution"
     OperationsOverview:

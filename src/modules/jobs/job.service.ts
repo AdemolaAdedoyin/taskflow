@@ -1,4 +1,4 @@
-import { Job, JobStatus, ScheduleType } from "@prisma/client";
+import { ExecutionStatus, Job, JobStatus, ScheduleType } from "@prisma/client";
 import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
@@ -115,6 +115,73 @@ export async function getJob(id: string) {
   });
   if (!job) throw new NotFoundError("Job", id);
   return job;
+}
+
+type ExecutionCursor = {
+  startedAt: Date;
+  id: string;
+};
+
+function encodeExecutionCursor(cursor: ExecutionCursor) {
+  return Buffer.from(
+    JSON.stringify({ startedAt: cursor.startedAt.toISOString(), id: cursor.id }),
+    "utf8"
+  ).toString("base64url");
+}
+
+function decodeExecutionCursor(value: string): ExecutionCursor {
+  try {
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as {
+      startedAt?: unknown;
+      id?: unknown;
+    };
+    if (typeof decoded.startedAt !== "string" || typeof decoded.id !== "string" || decoded.id.length === 0) {
+      throw new Error("invalid cursor shape");
+    }
+    const startedAt = new Date(decoded.startedAt);
+    if (Number.isNaN(startedAt.getTime())) throw new Error("invalid cursor timestamp");
+    return { startedAt, id: decoded.id };
+  } catch {
+    throw new AppError("cursor is invalid", 422, "VALIDATION_ERROR");
+  }
+}
+
+export async function listJobExecutions(
+  id: string,
+  options: { status?: ExecutionStatus; limit: number; cursor?: string }
+) {
+  const job = await prisma.job.findUnique({ where: { id }, select: { id: true } });
+  if (!job) throw new NotFoundError("Job", id);
+
+  const cursor = options.cursor ? decodeExecutionCursor(options.cursor) : undefined;
+  const rows = await prisma.jobExecution.findMany({
+    where: {
+      jobId: id,
+      status: options.status,
+      ...(cursor
+        ? {
+            OR: [
+              { startedAt: { lt: cursor.startedAt } },
+              { startedAt: cursor.startedAt, id: { lt: cursor.id } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+    take: options.limit + 1,
+  });
+
+  const hasMore = rows.length > options.limit;
+  const data = hasMore ? rows.slice(0, options.limit) : rows;
+  const last = data[data.length - 1];
+
+  return {
+    data,
+    pageInfo: {
+      nextCursor: hasMore && last ? encodeExecutionCursor({ startedAt: last.startedAt, id: last.id }) : null,
+      hasMore,
+    },
+  };
 }
 
 export async function cancelJob(id: string) {

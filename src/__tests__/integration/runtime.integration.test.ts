@@ -95,6 +95,51 @@ integration("Postgres + Redis runtime integration", () => {
     expect(queued?.data).toEqual({ jobId: first.id });
   });
 
+  it("paginates durable execution history without duplicates", async () => {
+    const job = await prisma.job.create({
+      data: {
+        type: "log_message",
+        payload: { message: "history" },
+        scheduleType: "ONCE",
+        runAt: new Date(),
+      },
+    });
+
+    const now = Date.now();
+    for (let index = 0; index < 3; index += 1) {
+      await prisma.jobExecution.create({
+        data: {
+          jobId: job.id,
+          attemptNumber: index + 1,
+          status: index === 0 ? "SUCCEEDED" : "FAILED",
+          startedAt: new Date(now - index * 1_000),
+          finishedAt: new Date(now - index * 1_000 + 100),
+          durationMs: 100,
+        },
+      });
+    }
+
+    const headers = { authorization: `Bearer ${process.env.TASKFLOW_API_KEY}` };
+    const firstResponse = await fetch(`${baseUrl}/v1/jobs/${job.id}/executions?limit=2`, { headers });
+    expect(firstResponse.status).toBe(200);
+    const firstPage: any = await firstResponse.json();
+
+    expect(firstPage.data).toHaveLength(2);
+    expect(firstPage.pageInfo.hasMore).toBe(true);
+    expect(firstPage.pageInfo.nextCursor).toEqual(expect.any(String));
+
+    const secondResponse = await fetch(
+      `${baseUrl}/v1/jobs/${job.id}/executions?limit=2&cursor=${encodeURIComponent(firstPage.pageInfo.nextCursor)}`,
+      { headers }
+    );
+    expect(secondResponse.status).toBe(200);
+    const secondPage: any = await secondResponse.json();
+
+    expect(secondPage.data).toHaveLength(1);
+    expect(secondPage.pageInfo).toEqual({ nextCursor: null, hasMore: false });
+    expect(new Set([...firstPage.data, ...secondPage.data].map((execution: any) => execution.id)).size).toBe(3);
+  });
+
   it("exposes authenticated queue and durable-job operational counts", async () => {
     const response = await fetch(`${baseUrl}/v1/operations/overview`, {
       headers: { authorization: `Bearer ${process.env.TASKFLOW_API_KEY}` },
