@@ -1,4 +1,4 @@
-import { JobExecution } from "@prisma/client";
+import { ExecutionStatus, Prisma } from "@prisma/client";
 import { config } from "../config";
 import { prisma } from "../db";
 import { logger } from "../lib/logger";
@@ -51,8 +51,11 @@ export function startExecutionHeartbeat(executionId: string) {
 
 export async function finishExecution(
   executionId: string,
-  data: Pick<JobExecution, "status" | "finishedAt" | "durationMs"> & {
-    result?: JobExecution["result"];
+  data: {
+    status: ExecutionStatus;
+    finishedAt: Date;
+    durationMs: number;
+    result?: Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput;
     error?: string | null;
   }
 ) {
