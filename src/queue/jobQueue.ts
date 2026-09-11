@@ -126,3 +126,11 @@ export async function getNextRecurringRun(jobId: string): Promise<Date | null> {
   const match = schedulers.find((s) => s.id === recurringSchedulerId(jobId));
   return match?.next ? new Date(match.next) : null;
 }
+
+/** Close Queue + the shared Redis connection after workers/producers stop using them. */
+export async function closeQueueResources() {
+  await jobQueue.close();
+  if (redisConnection.status !== "end") {
+    await redisConnection.quit();
+  }
+}
