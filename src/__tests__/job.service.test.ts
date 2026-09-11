@@ -34,6 +34,12 @@ vi.mock("../db", () => {
           jobs.set(where.id, record);
           return record;
         }),
+        updateMany: vi.fn(async ({ where, data }: any) => {
+          const record = jobs.get(where.id);
+          if (!record || (where.status && record.status !== where.status)) return { count: 0 };
+          jobs.set(where.id, { ...record, ...data });
+          return { count: 1 };
+        }),
         findMany: vi.fn(async () => [...jobs.values()]),
       },
     },
@@ -48,7 +54,7 @@ vi.mock("../queue/jobQueue", () => ({
 
 import { prisma } from "../db";
 import * as jobService from "../modules/jobs/job.service";
-import { ensureJobScheduled } from "../queue/jobQueue";
+import { cancelOnceJob, ensureJobScheduled } from "../queue/jobQueue";
 
 describe("job.service", () => {
   beforeEach(() => {
@@ -153,5 +159,33 @@ describe("job.service", () => {
 
     expect(result).toBe(winner);
     expect(ensureJobScheduled).toHaveBeenCalledWith(winner);
+  });
+
+  it("durably cancels a scheduled one-off job before queue cleanup", async () => {
+    const job = await jobService.createJob({
+      type: "log_message",
+      payload: { message: "later" },
+      schedule: { type: "once", runAt: new Date(Date.now() + 60_000).toISOString() },
+    });
+
+    const result = await jobService.cancelJob(job.id);
+
+    expect(result.status).toBe("CANCELLED");
+    expect(prisma.job.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: job.id, status: "SCHEDULED" } })
+    );
+    expect(cancelOnceJob).toHaveBeenCalledWith(job.id);
+  });
+
+  it("refuses to report cancellation for a running job", async () => {
+    const job = await jobService.createJob({
+      type: "log_message",
+      payload: { message: "running" },
+      schedule: { type: "once" },
+    });
+    await prisma.job.update({ where: { id: job.id }, data: { status: "RUNNING" } });
+
+    await expect(jobService.cancelJob(job.id)).rejects.toThrow(/currently running/);
+    expect(cancelOnceJob).not.toHaveBeenCalled();
   });
 });
