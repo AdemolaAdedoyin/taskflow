@@ -27,10 +27,11 @@ async function processJob(bullJob: BullJob<JobPayload>) {
     return;
   }
 
-  if (job.scheduleType === "RECURRING" && bullJob.attemptsMade === 0) {
-    // A recurring cron tick can arrive while the previous tick is still
-    // running. Claim the durable definition atomically so only one first
-    // attempt runs at a time across all worker processes.
+  if (bullJob.attemptsMade === 0) {
+    // First attempts must atomically claim durable SCHEDULED state. This both
+    // prevents overlapping recurring firings and closes the race where a
+    // one-off worker could overwrite a concurrent CANCELLED transition after
+    // its initial read.
     const claim = await prisma.job.updateMany({
       where: { id: jobId, status: "SCHEDULED" },
       data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
@@ -38,10 +39,14 @@ async function processJob(bullJob: BullJob<JobPayload>) {
 
     if (claim.count === 0) {
       const latest = await prisma.job.findUnique({ where: { id: jobId }, select: { status: true } });
-      logger.info({ jobId, status: latest?.status }, "skipping overlapping recurring firing");
+      logger.info(
+        { jobId, status: latest?.status, scheduleType: job.scheduleType },
+        "skipping unclaimable first firing"
+      );
       return;
     }
   } else {
+    // Retries belong to a firing that already owns the durable RUNNING state.
     await prisma.job.update({
       where: { id: jobId },
       data: { status: "RUNNING", attemptCount: attemptNumber, lastRunAt: new Date() },
