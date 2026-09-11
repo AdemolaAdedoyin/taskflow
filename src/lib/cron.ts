@@ -1,9 +1,9 @@
 import { CronExpressionParser } from "cron-parser";
 
-export function isValidCronExpression(expression: string): boolean {
+export function isValidCronExpression(expression: string, timezone?: string): boolean {
   if (!expression || !expression.trim()) return false;
   try {
-    CronExpressionParser.parse(expression);
+    CronExpressionParser.parse(expression, timezone ? { tz: timezone } : undefined);
     return true;
   } catch {
     return false;
