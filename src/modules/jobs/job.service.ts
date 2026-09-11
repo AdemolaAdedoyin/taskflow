@@ -1,3 +1,4 @@
+import { JobStatus, ScheduleType } from "@prisma/client";
 import { prisma } from "../../db";
 import { NotFoundError, ConflictError, AppError } from "../../lib/errors";
 import { isValidCronExpression, nextRunFromCron } from "../../lib/cron";
@@ -72,12 +73,17 @@ export async function createJob(input: CreateJobInput) {
   return job;
 }
 
-export async function listJobs(options: { status?: string; type?: string; scheduleType?: string; limit: number }) {
+export async function listJobs(options: {
+  status?: JobStatus;
+  type?: string;
+  scheduleType?: ScheduleType;
+  limit: number;
+}) {
   return prisma.job.findMany({
     where: {
-      status: options.status as any,
+      status: options.status,
       type: options.type,
-      scheduleType: options.scheduleType as any,
+      scheduleType: options.scheduleType,
     },
     orderBy: { createdAt: "desc" },
     take: options.limit,
