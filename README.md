@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/AdemolaAdedoyin/taskflow/actions/workflows/ci.yml/badge.svg)](https://github.com/AdemolaAdedoyin/taskflow/actions/workflows/ci.yml)
 
-I built Taskflow as a backend-focused job scheduling service for work that needs to run later, retry safely, or execute on a recurring schedule. It combines PostgreSQL as the durable source of truth with Redis/BullMQ as the execution layer, and it deliberately focuses on the failure modes that make queue systems interesting: duplicate requests, partial Redis failures, cancellation races, overlapping recurring runs, retries, worker shutdown, and recovery.
+I built Taskflow as a backend-focused job scheduling service for work that needs to run later, retry safely, or execute on a recurring schedule. It combines PostgreSQL as the durable source of truth with Redis/BullMQ as the execution layer, and it deliberately focuses on the failure modes that make queue systems interesting: duplicate requests, partial Redis failures, cancellation races, overlapping recurring runs, retries, worker shutdown, recovery, and reliable completion notifications.
 
 **Stack:** Node.js, TypeScript, Express, PostgreSQL + Prisma, Redis + BullMQ, Zod, Pino, Vitest, OpenAPI/Swagger, Docker Compose, GitHub Actions.
 
@@ -14,8 +14,9 @@ I built Taskflow as a backend-focused job scheduling service for work that needs
 - **Concurrency-safe execution** — first attempts atomically claim `SCHEDULED` jobs in PostgreSQL so cancellation and overlapping recurring ticks cannot both win.
 - **Retry audit trail** — BullMQ owns retry/backoff mechanics while every attempt is persisted as a `JobExecution` row.
 - **Scalable execution history** — long-running recurring jobs expose cursor-paginated, filterable execution history instead of forcing unbounded relation loads.
-- **Security boundaries** — bearer-token authentication, configurable rate limits/CORS/proxy handling, SSRF defenses, redirect blocking, and production outbound-host allowlisting for `http_request` jobs.
-- **Operational visibility** — request IDs, structured logs, liveness/readiness probes, queue counts, durable status counts, and process uptime.
+- **Durable completion callbacks** — optional callbacks are stored before they are queued, delivered on a separate BullMQ queue, retried with backoff, HMAC-signed, SSRF-checked, and recoverable after Redis failures.
+- **Security boundaries** — bearer-token authentication, configurable rate limits/CORS/proxy handling, SSRF defenses, redirect blocking, and production outbound-host allowlisting.
+- **Operational visibility** — request IDs, structured logs, liveness/readiness probes, job-queue counts, callback-queue counts, durable status counts, and process uptime.
 - **Real integration coverage** — CI starts PostgreSQL and Redis, applies migrations, exercises the HTTP API, verifies durable rows and queue projections, then builds the TypeScript project and production container.
 
 ## Architecture
@@ -30,21 +31,26 @@ flowchart LR
     Worker --> Handler[Handler registry]
     Handler -->|result / error| Worker
     Worker -->|JobExecution audit row| PG
+    Worker -->|persist CallbackDelivery| PG
+    Worker -->|enqueue callback| CallbackQueue[Callback BullMQ queue]
+    CallbackQueue --> CallbackWorker[Callback worker]
+    CallbackWorker -->|signed POST| Subscriber[Callback endpoint]
     API -->|health + operations| Ops[Health / Operations endpoints]
     Ops --> PG
     Ops --> Redis
 ```
 
-The important design choice is that PostgreSQL owns durable state. If Redis is unavailable immediately after a job is created, the `SCHEDULED` row remains recoverable. An idempotent retry or startup reconciliation can safely recreate the queue entry.
+The important design choice is that PostgreSQL owns durable state. If Redis is unavailable immediately after a job or callback delivery is created, the durable row remains recoverable. Idempotent retries and startup reconciliation rebuild missing queue projections.
 
 ## Scheduling and execution flow
 
-1. `POST /v1/jobs` validates the handler type and schedule.
+1. `POST /v1/jobs` validates the handler type, schedule, and optional callback configuration.
 2. Taskflow creates the durable PostgreSQL `Job` row.
 3. It projects that job into BullMQ using a deterministic one-off ID or a recurring Job Scheduler.
 4. A worker atomically claims the durable job before executing the handler.
 5. Every attempt is recorded as a `JobExecution` with timing, result, or error details.
 6. One-off jobs become `SUCCEEDED` or `FAILED`; recurring jobs return to `SCHEDULED` for the next tick unless cancelled.
+7. When an execution reaches its final outcome, Taskflow persists a `CallbackDelivery` before enqueueing the signed callback on a separate queue.
 
 ## Built-in handlers
 
@@ -56,12 +62,12 @@ The OpenAPI document is served at `/openapi.json`, with interactive Swagger UI a
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /v1/jobs` | Create a one-off or recurring job |
+| `POST /v1/jobs` | Create a one-off or recurring job, optionally with a completion callback |
 | `GET /v1/jobs` | Filter/list jobs |
 | `GET /v1/jobs/:id` | Job detail + 20 most recent executions |
 | `GET /v1/jobs/:id/executions` | Cursor-paginated execution history with status filtering |
 | `POST /v1/jobs/:id/cancel` | Cancel a scheduled job safely |
-| `GET /v1/operations/overview` | Authenticated queue + durable-state overview |
+| `GET /v1/operations/overview` | Authenticated job/callback queue + durable-state overview |
 | `GET /health/live` | Process liveness |
 | `GET /health/ready` | PostgreSQL + Redis readiness |
 | `GET /health` | Backward-compatible lightweight health endpoint |
@@ -82,6 +88,25 @@ curl -H "Authorization: Bearer <your key>" \
 ```
 
 Follow `pageInfo.nextCursor` until `pageInfo.hasMore` is false.
+
+## Completion callbacks
+
+A job can request a callback by supplying `callbackUrl` when it is created:
+
+```json
+{
+  "type": "log_message",
+  "payload": { "message": "notify me when this finishes" },
+  "schedule": { "type": "once" },
+  "callbackUrl": "https://api.example.com/taskflow/events"
+}
+```
+
+Taskflow delivers a `POST` after a successful execution or after the final failed attempt. Recurring jobs can therefore emit one callback per completed firing. Delivery runs independently from the business handler, so a callback outage does not cause the original job to execute again.
+
+Each request includes `x-taskflow-delivery-id` and `x-taskflow-signature`. The signature is `sha256=<hex>` where the hex value is HMAC-SHA256 over the exact raw request body using `CALLBACK_SIGNING_SECRET`. Consumers should verify the raw body before parsing JSON and make processing idempotent using the delivery ID.
+
+Callbacks have their own retry/backoff policy and durable `CallbackDelivery` record. Redirects are not followed, targets are checked against private/reserved networks on every attempt, and production destinations must match `CALLBACK_ALLOWED_HOSTS`.
 
 ## Run locally
 
@@ -158,9 +183,12 @@ The main production-facing settings are documented in `.env.example`:
 
 - `DATABASE_URL` / `REDIS_URL` — durable and queue infrastructure.
 - `TASKFLOW_API_KEY` — shared bearer token; production requires at least 32 characters.
-- `JOB_CONCURRENCY` — worker concurrency.
+- `JOB_CONCURRENCY` — business-job worker concurrency.
 - `CORS_ORIGINS` — explicit browser-origin allowlist.
-- `HTTP_ALLOWED_HOSTS` — exact production allowlist for outbound HTTP jobs; an empty list disables them in production.
+- `HTTP_ALLOWED_HOSTS` — exact production allowlist for `http_request` jobs; an empty list disables them in production.
+- `CALLBACK_ALLOWED_HOSTS` — exact production allowlist for completion callback destinations.
+- `CALLBACK_SIGNING_SECRET` — HMAC secret used to sign callback bodies; use at least 32 random characters when callbacks are enabled in production.
+- `CALLBACK_MAX_ATTEMPTS`, `CALLBACK_TIMEOUT_MS`, `CALLBACK_CONCURRENCY` — callback retry, timeout, and worker controls.
 - `API_RATE_LIMIT_REQUESTS` / `API_RATE_LIMIT_WINDOW_MS` — API abuse protection.
 - `TRUST_PROXY_HOPS` — set only behind a trusted reverse proxy.
 
@@ -190,7 +218,9 @@ GitHub Actions automatically runs the full path on every PR: dependency install,
 
 **Cursor pagination for audit history.** Execution pages are ordered by `startedAt` and `id`, with an opaque cursor carrying both values. A matching composite PostgreSQL index keeps per-job history scans efficient and deterministic.
 
-**Graceful shutdown.** The API stops accepting traffic before closing queue/Redis/Postgres resources; the worker stops taking new work and waits for active handlers before disconnecting dependencies.
+**Callbacks are a separate failure domain.** The callback intent is persisted before Redis enqueue and delivered by a separate worker with its own retries. A callback failure never changes a completed job back into a failed/retried business execution.
+
+**Graceful shutdown.** The API stops accepting traffic before closing queue/Redis/Postgres resources; the worker stops taking new work and waits for active handlers and callback deliveries before disconnecting dependencies.
 
 ## Project layout
 
@@ -201,9 +231,11 @@ src/
     health/               # liveness/readiness
     operations/           # authenticated runtime overview
   queue/
-    jobQueue.ts           # deterministic enqueue / scheduler helpers
-    reconcile.ts          # rebuild missing queue projections
-    worker.ts             # claim, execute, persist attempts, graceful shutdown
+    jobQueue.ts           # deterministic job enqueue / scheduler helpers
+    callbackQueue.ts      # deterministic completion-callback queue
+    callbackDelivery.ts   # durable callback lifecycle, signing, delivery
+    reconcile.ts          # rebuild missing job/callback queue projections
+    worker.ts             # jobs + callbacks + graceful shutdown
     handlers/             # pluggable job implementations
   lib/                    # cron, networking/SSRF protection, logging, errors
   middleware/             # auth + centralized error handling
@@ -216,6 +248,11 @@ openapi.yaml
 .github/workflows/ci.yml
 ```
 
-## Next steps
+## Remaining roadmap
 
-I would extend Taskflow next with callback/webhook delivery on job completion, per-handler concurrency/rate limits, stronger multi-client authentication/authorization, metrics export for Prometheus/OpenTelemetry, and a production deployment example using managed PostgreSQL and Redis.
+After completion callbacks, the remaining portfolio phases are:
+
+- **Phase 10 — per-handler concurrency and rate limits** so expensive handlers can be isolated from lightweight work.
+- **Phase 11 — stronger multi-client authentication/authorization** instead of one shared API key.
+- **Phase 12 — metrics and deployment** with Prometheus/OpenTelemetry-style export plus a concrete managed PostgreSQL/Redis deployment example.
+- **Final phase — API documentation and portfolio walkthrough.** Because Taskflow is intentionally backend-only, I will treat the API documentation as part of the product: tighten the OpenAPI contract, add complete request/response/error examples, callback-signature verification examples, an error/status catalog, deployment/runbook notes, architecture diagrams, and a guided curl/Swagger walkthrough that lets a reviewer understand and exercise the system without a frontend.
