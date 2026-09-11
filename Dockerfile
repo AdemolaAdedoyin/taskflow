@@ -10,6 +10,10 @@ COPY tsconfig.json openapi.yaml ./
 COPY src ./src
 RUN npm run prisma:generate && npm run build
 
+# --- one-off migration job ---
+FROM builder AS migrator
+CMD ["npm", "run", "prisma:deploy"]
+
 # --- runtime ---
 FROM node:22-alpine AS runner
 WORKDIR /app
