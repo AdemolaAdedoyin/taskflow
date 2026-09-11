@@ -9,7 +9,7 @@ import swaggerUi from "swagger-ui-express";
 import YAML from "yaml";
 import { config } from "./config";
 import { logger } from "./lib/logger";
-import { requireAuth } from "./middleware/auth";
+import { assertApiAuthConfiguration, requireAuth } from "./middleware/auth";
 import { errorHandler } from "./middleware/errorHandler";
 import { authRouter } from "./modules/auth/auth.routes";
 import { healthRouter } from "./modules/health/health.routes";
@@ -23,6 +23,7 @@ function requestIdFromHeader(value: string | string[] | undefined) {
 }
 
 export function createApp() {
+  assertApiAuthConfiguration();
   const app = express();
 
   if (config.TRUST_PROXY_HOPS > 0) {
