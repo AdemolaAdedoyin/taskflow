@@ -6,6 +6,7 @@ const integration = runIntegration ? describe : describe.skip;
 integration("stale execution recovery", () => {
   let prisma: any;
   let recoverStaleExecutions: (jobId?: string) => Promise<{ checked: number; recovered: number }>;
+  let createdJobId: string | undefined;
 
   beforeAll(async () => {
     const [db, lease] = await Promise.all([
@@ -14,18 +15,12 @@ integration("stale execution recovery", () => {
     ]);
     prisma = db.prisma;
     recoverStaleExecutions = lease.recoverStaleExecutions;
-
-    await prisma.callbackDelivery.deleteMany();
-    await prisma.jobExecution.deleteMany();
-    await prisma.job.deleteMany();
   });
 
   afterAll(async () => {
-    if (!prisma) return;
-    await prisma.callbackDelivery.deleteMany();
-    await prisma.jobExecution.deleteMany();
-    await prisma.job.deleteMany();
-    await prisma.$disconnect();
+    if (prisma && createdJobId) {
+      await prisma.job.delete({ where: { id: createdJobId } }).catch(() => undefined);
+    }
   });
 
   it("marks an abandoned execution failed and makes its job schedulable again", async () => {
@@ -39,6 +34,7 @@ integration("stale execution recovery", () => {
         attemptCount: 1,
       },
     });
+    createdJobId = job.id;
 
     const execution = await prisma.jobExecution.create({
       data: {
