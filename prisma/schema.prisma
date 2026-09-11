@@ -68,5 +68,5 @@ model JobExecution {
   result        Json?
   error         String?
 
-  @@index([jobId])
+  @@index([jobId, startedAt, id])
 }
