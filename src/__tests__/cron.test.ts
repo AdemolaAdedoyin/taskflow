@@ -11,7 +11,12 @@ describe("cron helpers", () => {
   it("rejects garbage input", () => {
     expect(isValidCronExpression("not a cron")).toBe(false);
     expect(isValidCronExpression("")).toBe(false);
-    expect(isValidCronExpression("61 * * * *")).toBe(false); // minute out of range
+    expect(isValidCronExpression("61 * * * *")).toBe(false);
+  });
+
+  it("validates timezone and cron together", () => {
+    expect(isValidCronExpression("0 2 * * *", "UTC")).toBe(true);
+    expect(isValidCronExpression("0 2 * * *", "Mars/Olympus_Mons")).toBe(false);
   });
 
   it("computes a next-run time in the future", () => {
@@ -22,7 +27,6 @@ describe("cron helpers", () => {
   it("respects an explicit timezone", () => {
     const utc = nextRunFromCron("0 12 * * *", "UTC");
     const ny = nextRunFromCron("0 12 * * *", "America/New_York");
-    // Noon UTC and noon in New York are different instants.
     expect(utc.getTime()).not.toEqual(ny.getTime());
   });
 });
