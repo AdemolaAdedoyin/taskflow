@@ -1,3 +1,4 @@
+import { Job } from "@prisma/client";
 import { Queue } from "bullmq";
 import { redisConnection } from "./connection";
 
@@ -30,6 +31,9 @@ export async function enqueueOnceJob(
     "run",
     { jobId },
     {
+      // A deterministic BullMQ id makes re-enqueue attempts safe: if the API
+      // retries after an ambiguous Redis/network failure, BullMQ won't create
+      // a second copy of the same one-off job while the original still exists.
       jobId: `once:${jobId}`,
       delay: opts.delayMs,
       ...jobOptions(opts.priority, opts.maxAttempts),
@@ -55,6 +59,39 @@ export async function upsertRecurringJob(
       opts: jobOptions(opts.priority, opts.maxAttempts),
     }
   );
+}
+
+/**
+ * Make Redis reflect a durable SCHEDULED job definition.
+ *
+ * This operation is intentionally idempotent. One-off jobs use deterministic
+ * BullMQ ids and recurring jobs use `upsertJobScheduler`, so callers can use
+ * this both immediately after a Postgres insert and later during recovery.
+ */
+export async function ensureJobScheduled(job: Job) {
+  if (job.status !== "SCHEDULED") return;
+
+  if (job.scheduleType === "ONCE") {
+    const runAt = job.runAt ?? new Date();
+    const delayMs = Math.max(0, runAt.getTime() - Date.now());
+    await enqueueOnceJob(job.id, {
+      delayMs,
+      priority: job.priority,
+      maxAttempts: job.maxAttempts,
+    });
+    return;
+  }
+
+  if (!job.cronExpression) {
+    throw new Error(`Recurring job ${job.id} is missing cronExpression`);
+  }
+
+  await upsertRecurringJob(job.id, {
+    cronExpression: job.cronExpression,
+    timezone: job.timezone,
+    priority: job.priority,
+    maxAttempts: job.maxAttempts,
+  });
 }
 
 export async function removeRecurringJob(jobId: string) {
