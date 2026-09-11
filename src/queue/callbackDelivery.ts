@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { Job, JobExecution } from "@prisma/client";
 import { config } from "../config";
 import { prisma } from "../db";
+import { readResponseTextLimited } from "../lib/http";
 import { assertSafeHttpUrl } from "../lib/network";
 
 function callbackHostname(rawUrl: string) {
@@ -15,7 +16,6 @@ function callbackHostname(rawUrl: string) {
   return { target, hostname: target.hostname.toLowerCase() };
 }
 
-/** Validate static callback configuration before a durable job is accepted. */
 export function assertCallbackConfiguredUrl(rawUrl: string) {
   const { hostname } = callbackHostname(rawUrl);
   const allowedHosts = new Set(config.CALLBACK_ALLOWED_HOSTS);
@@ -63,10 +63,6 @@ export function buildCallbackBody(
   });
 }
 
-/**
- * Persist the intent before touching Redis so a queue outage cannot lose the
- * callback. executionId is unique, making this safe to call more than once.
- */
 export async function scheduleCompletionCallback(job: Job, execution: JobExecution) {
   if (!job.callbackUrl) return null;
 
@@ -81,8 +77,6 @@ export async function scheduleCompletionCallback(job: Job, execution: JobExecuti
   });
 
   if (delivery.status === "PENDING") {
-    // Load the Redis projection only when scheduling is actually required so
-    // pure callback validation/signature unit tests stay infrastructure-free.
     const { enqueueCallbackDelivery } = await import("./callbackQueue");
     await enqueueCallbackDelivery(delivery.id);
   }
@@ -100,8 +94,6 @@ export async function deliverCallback(deliveryId: string, attemptNumber: number)
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
   try {
-    // Re-check the network boundary for every attempt. DNS can change between
-    // job creation and delivery, so static allowlisting alone is not enough.
     const target = await assertSafeHttpUrl(delivery.url);
     assertCallbackConfiguredUrl(target.toString());
 
@@ -124,13 +116,15 @@ export async function deliverCallback(deliveryId: string, attemptNumber: number)
     responseStatus = response.status;
 
     if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => undefined);
       throw new Error(`Callback returned redirect HTTP ${response.status}; redirects are not followed`);
     }
     if (!response.ok) {
-      const responseBody = await response.text().catch(() => "");
-      throw new Error(`Callback failed with HTTP ${response.status}: ${responseBody.slice(0, 300)}`);
+      const responseBody = await readResponseTextLimited(response, 300).catch(() => "");
+      throw new Error(`Callback failed with HTTP ${response.status}: ${responseBody}`);
     }
 
+    await response.body?.cancel().catch(() => undefined);
     await prisma.callbackDelivery.update({
       where: { id: delivery.id },
       data: {
