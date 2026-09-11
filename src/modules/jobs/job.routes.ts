@@ -22,6 +22,7 @@ const createSchema = z
     priority: z.number().int().min(0).max(10).optional(),
     maxAttempts: z.number().int().min(1).max(20).optional(),
     idempotencyKey: z.string().min(1).max(200).optional(),
+    callbackUrl: z.string().url().max(2048).optional(),
   })
   // `unknown` intentionally permits any JSON-shaped payload, including null.
   // Presence still matters: omitting payload entirely is a malformed create request.
@@ -54,6 +55,7 @@ jobRouter.post("/", async (req, res, next) => {
       priority: parsed.data.priority,
       maxAttempts: parsed.data.maxAttempts,
       idempotencyKey: parsed.data.idempotencyKey,
+      callbackUrl: parsed.data.callbackUrl,
     });
     res.status(201).json(job);
   } catch (err) {
