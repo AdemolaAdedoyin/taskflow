@@ -10,7 +10,9 @@ const allowedScopes = new Set<ApiScope>(["jobs.read", "jobs.write", "operations.
 
 /**
  * Format: clientId:secret:scope|scope,clientId2:secret2:scope
- * Secrets should be base64url/hex-like values without commas or colons.
+ * Client IDs intentionally exclude dots because bearer tokens use
+ * `<clientId>.<secret>` as their wire format. Secrets should be
+ * base64url/hex-like values without commas or colons.
  */
 export function parseApiClients(value: string): ApiClientConfig[] {
   if (!value.trim()) return [];
@@ -36,8 +38,8 @@ export function parseApiClients(value: string): ApiClientConfig[] {
       .map((scope) => scope.trim())
       .filter(Boolean) as ApiScope[];
 
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) {
-      throw new Error(`Invalid TASKFLOW_API_CLIENTS client id '${id}'. Use 1-64 letters, numbers, dot, underscore, or dash.`);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+      throw new Error(`Invalid TASKFLOW_API_CLIENTS client id '${id}'. Use 1-64 letters, numbers, underscore, or dash.`);
     }
     if (!secret || /[:,\s]/.test(secret)) {
       throw new Error(`Invalid TASKFLOW_API_CLIENTS secret for '${id}'. Secrets must not contain commas, colons, or whitespace.`);
