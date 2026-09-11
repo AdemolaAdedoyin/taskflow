@@ -49,22 +49,26 @@ function idempotencyFingerprint(input: CreateJobInput, priority: number, maxAtte
 }
 
 async function returnExistingJob(existing: Job, fingerprint: string) {
-  // Rows created before request fingerprints were introduced remain compatible,
-  // but all new idempotency keys are bound to one normalized job definition.
   if (existing.idempotencyFingerprint && existing.idempotencyFingerprint !== fingerprint) {
     throw new ConflictError("Idempotency key was already used with a different job definition");
   }
 
-  // A previous request may have committed the durable Job row and then lost
-  // its Redis acknowledgement. Re-running the idempotent scheduling operation
-  // repairs that gap instead of merely returning a stranded SCHEDULED record.
   await ensureJobScheduled(existing);
   return existing;
 }
 
+const publicExecutionSelect = {
+  id: true,
+  attemptNumber: true,
+  status: true,
+  startedAt: true,
+  finishedAt: true,
+  durationMs: true,
+  result: true,
+  error: true,
+} as const;
+
 export async function createJob(input: CreateJobInput) {
-  // Fail fast if nothing is registered for this type, rather than accepting
-  // a job that will error out on its very first execution.
   getHandler(input.type);
 
   if (input.callbackUrl) {
@@ -125,18 +129,13 @@ export async function createJob(input: CreateJobInput) {
 
   if (input.idempotencyKey) {
     const existing = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-    if (existing) {
-      return returnExistingJob(existing, fingerprint);
-    }
+    if (existing) return returnExistingJob(existing, fingerprint);
   }
 
   let job: Job;
   try {
     job = await prisma.job.create({ data });
   } catch (error) {
-    // The pre-read above is only an optimization. The unique index is the
-    // actual concurrency boundary: if two callers race on the same key, the
-    // loser reads the winning row and performs the same safe queue repair.
     if (input.idempotencyKey && isUniqueConstraintError(error)) {
       const winner = await prisma.job.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
       if (winner) return returnExistingJob(winner, fingerprint);
@@ -144,9 +143,6 @@ export async function createJob(input: CreateJobInput) {
     throw error;
   }
 
-  // Postgres is the source of truth. If Redis is unavailable here, preserve
-  // the SCHEDULED row and fail the request. A retry with the same idempotency
-  // key, or startup reconciliation, can safely recreate the missing queue item.
   await ensureJobScheduled(job);
   return job;
 }
@@ -171,7 +167,13 @@ export async function listJobs(options: {
 export async function getJob(id: string) {
   const job = await prisma.job.findUnique({
     where: { id },
-    include: { executions: { orderBy: { startedAt: "desc" }, take: 20 } },
+    include: {
+      executions: {
+        orderBy: { startedAt: "desc" },
+        take: 20,
+        select: publicExecutionSelect,
+      },
+    },
   });
   if (!job) throw new NotFoundError("Job", id);
   return job;
@@ -229,6 +231,7 @@ export async function listJobExecutions(
     },
     orderBy: [{ startedAt: "desc" }, { id: "desc" }],
     take: options.limit + 1,
+    select: publicExecutionSelect,
   });
 
   const hasMore = rows.length > options.limit;
@@ -251,8 +254,6 @@ export async function cancelJob(id: string) {
     throw new ConflictError(`Job is already in a terminal state (${job.status})`);
   }
   if (job.status === "RUNNING") {
-    // Handlers are arbitrary user code and cannot be safely pre-empted. Refuse
-    // to claim cancellation succeeded while a worker may still be executing it.
     throw new ConflictError("Job is currently running and cannot be cancelled safely");
   }
 
@@ -266,8 +267,6 @@ export async function cancelJob(id: string) {
     throw new ConflictError(`Job can no longer be cancelled (${latest?.status ?? "unknown state"})`);
   }
 
-  // Postgres changes first: if Redis cleanup fails or races with a worker, the
-  // durable CANCELLED state still prevents the queued firing from executing.
   try {
     if (job.scheduleType === "ONCE") {
       await cancelOnceJob(id);
