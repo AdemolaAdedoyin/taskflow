@@ -1,3 +1,4 @@
+import { Job, JobExecution } from "@prisma/client";
 import { Worker, Job as BullJob } from "bullmq";
 import { prisma } from "../db";
 import { config } from "../config";
@@ -7,9 +8,10 @@ import { deliverCallback, scheduleCompletionCallback } from "./callbackDelivery"
 import { redisConnection } from "./connection";
 import { QUEUE_NAME, JobPayload, closeQueueResources, getNextRecurringRun } from "./jobQueue";
 import { getHandler } from "./handlers";
+import { reconcilePendingCallbacks } from "./reconcile";
 
-async function queueCompletionCallback(job: Awaited<ReturnType<typeof prisma.job.findUnique>>, execution: any) {
-  if (!job?.callbackUrl) return;
+async function queueCompletionCallback(job: Job, execution: JobExecution) {
+  if (!job.callbackUrl) return;
   try {
     await scheduleCompletionCallback(job, execution);
   } catch (error) {
@@ -157,6 +159,10 @@ jobWorker.on("error", (err) => {
 
 callbackWorker.on("error", (err) => {
   logger.error({ err }, "callback worker-level error (e.g. Redis connection issue)");
+});
+
+void reconcilePendingCallbacks().catch((error) => {
+  logger.error({ err: error }, "worker callback reconciliation failed");
 });
 
 let shuttingDown = false;
