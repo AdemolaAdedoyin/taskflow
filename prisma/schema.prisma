@@ -1,0 +1,72 @@
+// Taskflow - data model
+// A Job is a definition: either a one-off task scheduled for a point in time,
+// or a recurring task driven by a cron expression. Every time it actually
+// runs, we record a JobExecution — this is what gives operators a real
+// audit trail instead of just "last known status".
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ScheduleType {
+  ONCE
+  RECURRING
+}
+
+enum JobStatus {
+  SCHEDULED // waiting for its runAt time, or a recurring job between runs
+  RUNNING
+  SUCCEEDED // terminal, ONCE jobs only
+  FAILED // terminal, ONCE jobs only — exhausted all attempts
+  CANCELLED // terminal
+}
+
+enum ExecutionStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model Job {
+  id             String        @id @default(cuid())
+  type           String // maps to a registered handler, e.g. "http_request"
+  payload        Json
+  scheduleType   ScheduleType
+  runAt          DateTime? // ONCE jobs: when to run (null = as soon as possible)
+  cronExpression String? // RECURRING jobs: standard 5-field cron
+  timezone       String        @default("UTC")
+  priority       Int           @default(0) // lower runs first, matches BullMQ convention
+  maxAttempts    Int           @default(5)
+  attemptCount   Int           @default(0) // attempts used in the most recent execution cycle
+  idempotencyKey String?       @unique
+  status         JobStatus     @default(SCHEDULED)
+  lastError      String?
+  lastRunAt      DateTime?
+  nextRunAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  executions     JobExecution[]
+
+  @@index([status, type])
+  @@index([scheduleType, status])
+}
+
+model JobExecution {
+  id            String          @id @default(cuid())
+  job           Job             @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId         String
+  attemptNumber Int
+  status        ExecutionStatus @default(RUNNING)
+  startedAt     DateTime        @default(now())
+  finishedAt    DateTime?
+  durationMs    Int?
+  result        Json?
+  error         String?
+
+  @@index([jobId])
+}

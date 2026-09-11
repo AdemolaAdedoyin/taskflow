@@ -1,0 +1,82 @@
+import { Queue } from "bullmq";
+import { redisConnection } from "./connection";
+
+export interface JobPayload {
+  jobId: string;
+}
+
+export const QUEUE_NAME = "taskflow-jobs";
+
+export const jobQueue = new Queue<JobPayload>(QUEUE_NAME, {
+  connection: redisConnection,
+});
+
+function jobOptions(priority: number, maxAttempts: number) {
+  return {
+    priority, // BullMQ convention: lower number = higher priority
+    attempts: maxAttempts,
+    backoff: { type: "exponential" as const, delay: 2000 },
+    removeOnComplete: { age: 24 * 3600, count: 1000 },
+    removeOnFail: { age: 7 * 24 * 3600 },
+  };
+}
+
+/** Enqueue a one-off job. `delayMs` defers the first attempt. */
+export async function enqueueOnceJob(
+  jobId: string,
+  opts: { delayMs?: number; priority: number; maxAttempts: number }
+) {
+  await jobQueue.add(
+    "run",
+    { jobId },
+    {
+      jobId: `once:${jobId}`,
+      delay: opts.delayMs,
+      ...jobOptions(opts.priority, opts.maxAttempts),
+    }
+  );
+}
+
+/**
+ * Register (or update) a recurring job using BullMQ's Job Scheduler API —
+ * the modern replacement for the older `repeat` option. Re-calling this with
+ * the same schedulerId updates the existing schedule instead of duplicating it.
+ */
+export async function upsertRecurringJob(
+  jobId: string,
+  opts: { cronExpression: string; timezone: string; priority: number; maxAttempts: number }
+) {
+  await jobQueue.upsertJobScheduler(
+    `recurring:${jobId}`,
+    { pattern: opts.cronExpression, tz: opts.timezone },
+    {
+      name: "run",
+      data: { jobId },
+      opts: jobOptions(opts.priority, opts.maxAttempts),
+    }
+  );
+}
+
+export async function removeRecurringJob(jobId: string) {
+  await jobQueue.removeJobScheduler(`recurring:${jobId}`);
+}
+
+/** Cancel a still-pending one-off job (no-op if it already started running). */
+export async function cancelOnceJob(jobId: string) {
+  const job = await jobQueue.getJob(`once:${jobId}`);
+  if (job) {
+    const state = await job.getState();
+    if (state === "waiting" || state === "delayed") {
+      await job.remove();
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Fetch the next scheduled run time for a recurring job's scheduler, if any. */
+export async function getNextRecurringRun(jobId: string): Promise<Date | null> {
+  const schedulers = await jobQueue.getJobSchedulers();
+  const match = schedulers.find((s) => s.id === `recurring:${jobId}`);
+  return match?.next ? new Date(match.next) : null;
+}

@@ -1,0 +1,191 @@
+openapi: 3.0.3
+info:
+  title: Taskflow API
+  description: >
+    Job scheduling and queue system. Create one-off jobs (run once, optionally
+    delayed) or recurring jobs (cron-style), with priorities, automatic
+    retries with backoff, and idempotent creation.
+  version: "1.0"
+servers:
+  - url: http://localhost:4000
+security:
+  - bearerAuth: []
+paths:
+  /v1/jobs:
+    post:
+      summary: Create a job
+      description: >
+        Creates a one-off or recurring job. If `idempotencyKey` is provided
+        and a job with that key already exists, the existing job is returned
+        instead of creating a duplicate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            examples:
+              delayedOnce:
+                summary: One-off job, run in 10 minutes
+                value:
+                  type: http_request
+                  payload: { url: "https://example.com/cache/warm", method: "POST" }
+                  schedule: { type: once, runAt: "2026-09-10T15:30:00Z" }
+                  maxAttempts: 3
+              recurring:
+                summary: Recurring job, every day at 2am UTC
+                value:
+                  type: log_message
+                  payload: { message: "nightly cleanup tick" }
+                  schedule: { type: recurring, cron: "0 2 * * *", timezone: "UTC" }
+      responses:
+        "201":
+          description: Job created (or the existing job, if idempotencyKey matched)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "422":
+          description: Validation error
+    get:
+      summary: List jobs
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/JobStatus"
+        - name: type
+          in: query
+          schema: { type: string }
+        - name: scheduleType
+          in: query
+          schema:
+            type: string
+            enum: [ONCE, RECURRING]
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: A page of jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+  /v1/jobs/{id}:
+    get:
+      summary: Get a job and its recent execution history
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobDetail"
+        "404":
+          description: Not found
+  /v1/jobs/{id}/cancel:
+    post:
+      summary: Cancel a scheduled or recurring job
+      description: >
+        No-op error if the job is already in a terminal state. Cancelling a
+        recurring job removes its BullMQ scheduler so no future ticks fire.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The cancelled job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "409":
+          description: Job already in a terminal state
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Set to the value of TASKFLOW_API_KEY
+  schemas:
+    JobStatus:
+      type: string
+      enum: [SCHEDULED, RUNNING, SUCCEEDED, FAILED, CANCELLED]
+    ScheduleOnce:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [once] }
+        runAt:
+          type: string
+          format: date-time
+          description: Omit to run as soon as possible.
+    ScheduleRecurring:
+      type: object
+      required: [type, cron]
+      properties:
+        type: { type: string, enum: [recurring] }
+        cron: { type: string, example: "0 2 * * *" }
+        timezone: { type: string, default: UTC, example: "America/New_York" }
+    CreateJobRequest:
+      type: object
+      required: [type, payload, schedule]
+      properties:
+        type:
+          type: string
+          description: Must match a registered handler (e.g. http_request, log_message).
+        payload:
+          description: Handler-specific input, validated by the handler itself.
+        schedule:
+          oneOf:
+            - $ref: "#/components/schemas/ScheduleOnce"
+            - $ref: "#/components/schemas/ScheduleRecurring"
+        priority: { type: integer, minimum: 0, maximum: 10, default: 0 }
+        maxAttempts: { type: integer, minimum: 1, maximum: 20, default: 5 }
+        idempotencyKey: { type: string }
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string }
+        payload: {}
+        scheduleType: { type: string, enum: [ONCE, RECURRING] }
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        priority: { type: integer }
+        maxAttempts: { type: integer }
+        attemptCount: { type: integer }
+        lastError: { type: string, nullable: true }
+        lastRunAt: { type: string, format: date-time, nullable: true }
+        nextRunAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+    JobExecution:
+      type: object
+      properties:
+        id: { type: string }
+        attemptNumber: { type: integer }
+        status: { type: string, enum: [RUNNING, SUCCEEDED, FAILED] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        durationMs: { type: integer, nullable: true }
+        result: { nullable: true }
+        error: { type: string, nullable: true }
+    JobDetail:
+      allOf:
+        - $ref: "#/components/schemas/Job"
+        - type: object
+          properties:
+            executions:
+              type: array
+              items:
+                $ref: "#/components/schemas/JobExecution"

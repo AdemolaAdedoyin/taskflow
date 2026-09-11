@@ -1,0 +1,46 @@
+{
+  "name": "taskflow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Job scheduling and queue system: one-off delayed jobs and cron-style recurring jobs, with priorities, retries, idempotency, and a pluggable handler registry.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "worker:dev": "tsx watch src/queue/worker.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "start:worker": "node dist/queue/worker.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "seed": "tsx src/scripts/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "bullmq": "^5.12.12",
+    "cors": "^2.8.5",
+    "cron-parser": "^5.10.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "ioredis": "^5.4.1",
+    "pino": "^9.4.0",
+    "pino-http": "^10.2.0",
+    "pino-pretty": "^11.2.2",
+    "swagger-ui-express": "^5.0.1",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.15",
+    "@types/swagger-ui-express": "^4.1.6",
+    "prisma": "^5.19.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

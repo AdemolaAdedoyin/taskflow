@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports:
+      - "5433:5432" # offset from webhook-relay so both stacks can run side by side
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    command: sh -c "npx prisma migrate deploy && node dist/index.js"
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: postgresql://taskflow:taskflow@postgres:5432/taskflow
+      REDIS_URL: redis://redis:6379
+      PORT: 4000
+      TASKFLOW_API_KEY: ${TASKFLOW_API_KEY:-dev-local-key}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: node dist/queue/worker.js
+    environment:
+      DATABASE_URL: postgresql://taskflow:taskflow@postgres:5432/taskflow
+      REDIS_URL: redis://redis:6379
+      TASKFLOW_API_KEY: ${TASKFLOW_API_KEY:-dev-local-key}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
