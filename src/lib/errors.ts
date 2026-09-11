@@ -34,3 +34,9 @@ export class UnauthorizedError extends AppError {
     super(message, 401, "UNAUTHORIZED");
   }
 }
+
+export class ForbiddenError extends AppError {
+  constructor(message = "API client does not have permission for this operation") {
+    super(message, 403, "FORBIDDEN");
+  }
+}
