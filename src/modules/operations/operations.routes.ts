@@ -1,13 +1,13 @@
 import { Router } from "express";
 import { config } from "../../config";
 import { prisma } from "../../db";
+import { requireScope } from "../../middleware/auth";
 import { callbackQueue } from "../../queue/callbackQueue";
 import { jobQueue } from "../../queue/jobQueue";
-import { requireAuth } from "../../middleware/auth";
 
 export const operationsRouter = Router();
 
-operationsRouter.get("/overview", requireAuth, async (_req, res, next) => {
+operationsRouter.get("/overview", requireScope("operations.read"), async (_req, res, next) => {
   try {
     const [jobQueueCounts, callbackQueueCounts, groupedJobs, groupedCallbacks] = await Promise.all([
       jobQueue.getJobCounts("waiting", "active", "delayed", "completed", "failed", "paused"),

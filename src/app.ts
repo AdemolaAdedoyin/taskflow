@@ -9,8 +9,9 @@ import swaggerUi from "swagger-ui-express";
 import YAML from "yaml";
 import { config } from "./config";
 import { logger } from "./lib/logger";
-import { requireAuth } from "./middleware/auth";
+import { assertApiAuthConfiguration, requireAuth } from "./middleware/auth";
 import { errorHandler } from "./middleware/errorHandler";
+import { authRouter } from "./modules/auth/auth.routes";
 import { healthRouter } from "./modules/health/health.routes";
 import { jobRouter } from "./modules/jobs/job.routes";
 import { operationsRouter } from "./modules/operations/operations.routes";
@@ -22,6 +23,7 @@ function requestIdFromHeader(value: string | string[] | undefined) {
 }
 
 export function createApp() {
+  assertApiAuthConfiguration();
   const app = express();
 
   if (config.TRUST_PROXY_HOPS > 0) {
@@ -60,8 +62,8 @@ export function createApp() {
   app.get("/openapi.json", (_req, res) => res.json(openapiDocument));
   app.use("/docs", swaggerUi.serve, swaggerUi.setup(openapiDocument));
 
-  // Apply abuse protection only to the authenticated API surface; health and
-  // documentation remain available for probes and interactive discovery.
+  // Rate-limit before auth so invalid credentials cannot bypass abuse controls.
+  // Once authenticated, every /v1 route receives a client identity and scopes.
   app.use(
     "/v1",
     rateLimit({
@@ -69,9 +71,11 @@ export function createApp() {
       limit: config.API_RATE_LIMIT_REQUESTS,
       standardHeaders: true,
       legacyHeaders: false,
-    })
+    }),
+    requireAuth
   );
-  app.use("/v1/jobs", requireAuth, jobRouter);
+  app.use("/v1/auth", authRouter);
+  app.use("/v1/jobs", jobRouter);
   app.use("/v1/operations", operationsRouter);
 
   app.use((req, res) => {

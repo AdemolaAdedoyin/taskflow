@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { ValidationError } from "../../lib/errors";
+import { requireScope } from "../../middleware/auth";
 import * as jobService from "./job.service";
 
 export const jobRouter = Router();
@@ -44,7 +45,15 @@ const executionListSchema = z.object({
   cursor: z.string().min(1).max(1024).optional(),
 });
 
-jobRouter.post("/", async (req, res, next) => {
+function parseJobId(rawId: string | undefined) {
+  const parsed = z.string().min(1).safeParse(rawId);
+  if (!parsed.success) {
+    throw new ValidationError({ id: ["A job id is required"] });
+  }
+  return parsed.data;
+}
+
+jobRouter.post("/", requireScope("jobs.write"), async (req, res, next) => {
   try {
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) throw new ValidationError(parsed.error.flatten());
@@ -63,7 +72,7 @@ jobRouter.post("/", async (req, res, next) => {
   }
 });
 
-jobRouter.get("/", async (req, res, next) => {
+jobRouter.get("/", requireScope("jobs.read"), async (req, res, next) => {
   try {
     const parsed = listSchema.safeParse(req.query);
     if (!parsed.success) throw new ValidationError(parsed.error.flatten());
@@ -73,27 +82,27 @@ jobRouter.get("/", async (req, res, next) => {
   }
 });
 
-jobRouter.get("/:id/executions", async (req, res, next) => {
+jobRouter.get("/:id/executions", requireScope("jobs.read"), async (req, res, next) => {
   try {
     const parsed = executionListSchema.safeParse(req.query);
     if (!parsed.success) throw new ValidationError(parsed.error.flatten());
-    res.json(await jobService.listJobExecutions(req.params.id, parsed.data));
+    res.json(await jobService.listJobExecutions(parseJobId(req.params.id), parsed.data));
   } catch (err) {
     next(err);
   }
 });
 
-jobRouter.get("/:id", async (req, res, next) => {
+jobRouter.get("/:id", requireScope("jobs.read"), async (req, res, next) => {
   try {
-    res.json(await jobService.getJob(req.params.id));
+    res.json(await jobService.getJob(parseJobId(req.params.id)));
   } catch (err) {
     next(err);
   }
 });
 
-jobRouter.post("/:id/cancel", async (req, res, next) => {
+jobRouter.post("/:id/cancel", requireScope("jobs.write"), async (req, res, next) => {
   try {
-    res.json(await jobService.cancelJob(req.params.id));
+    res.json(await jobService.cancelJob(parseJobId(req.params.id)));
   } catch (err) {
     next(err);
   }

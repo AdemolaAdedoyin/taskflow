@@ -3,6 +3,22 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const runIntegration = process.env.RUN_INTEGRATION_TESTS === "true";
 const integration = runIntegration ? describe : describe.skip;
 
+function configuredClientToken(clientId: string) {
+  const entry = (process.env.TASKFLOW_API_CLIENTS ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${clientId}:`));
+  if (!entry) return undefined;
+  const [id, secret] = entry.split(":");
+  return `${id}.${secret}`;
+}
+
+const legacyToken = process.env.TASKFLOW_API_KEY ?? "";
+const writerToken = configuredClientToken("writer") ?? legacyToken;
+const readerToken = configuredClientToken("reader") ?? legacyToken;
+const operatorToken = configuredClientToken("operator") ?? legacyToken;
+const hasScopedClients = Boolean(configuredClientToken("writer") && configuredClientToken("reader") && configuredClientToken("operator"));
+
 integration("Postgres + Redis runtime integration", () => {
   let prisma: any;
   let jobQueue: any;
@@ -83,6 +99,36 @@ integration("Postgres + Redis runtime integration", () => {
     });
   });
 
+  it("authenticates named API clients and enforces route scopes", async () => {
+    if (!hasScopedClients) return;
+
+    const whoami = await fetch(`${baseUrl}/v1/auth/whoami`, {
+      headers: { authorization: `Bearer ${readerToken}` },
+    });
+    expect(whoami.status).toBe(200);
+    expect(await whoami.json()).toEqual({ clientId: "reader", scopes: ["jobs.read"] });
+
+    const deniedWrite = await fetch(`${baseUrl}/v1/jobs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${readerToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "log_message",
+        payload: { message: "should not be accepted" },
+        schedule: { type: "once" },
+      }),
+    });
+    expect(deniedWrite.status).toBe(403);
+    expect(await deniedWrite.json()).toMatchObject({ error: { code: "FORBIDDEN" } });
+
+    const deniedOperations = await fetch(`${baseUrl}/v1/operations/overview`, {
+      headers: { authorization: `Bearer ${writerToken}` },
+    });
+    expect(deniedOperations.status).toBe(403);
+  });
+
   it("creates an idempotent API job that is durably stored and projected into BullMQ", async () => {
     const runAt = new Date(Date.now() + 5 * 60_000).toISOString();
     const body = {
@@ -96,7 +142,7 @@ integration("Postgres + Redis runtime integration", () => {
       fetch(`${baseUrl}/v1/jobs`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${process.env.TASKFLOW_API_KEY}`,
+          authorization: `Bearer ${writerToken}`,
           "content-type": "application/json",
         },
         body: JSON.stringify(body),
@@ -122,7 +168,7 @@ integration("Postgres + Redis runtime integration", () => {
     const response = await fetch(`${baseUrl}/v1/jobs`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${process.env.TASKFLOW_API_KEY}`,
+        authorization: `Bearer ${writerToken}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
@@ -204,7 +250,7 @@ integration("Postgres + Redis runtime integration", () => {
       });
     }
 
-    const headers = { authorization: `Bearer ${process.env.TASKFLOW_API_KEY}` };
+    const headers = { authorization: `Bearer ${readerToken}` };
     const firstResponse = await fetch(`${baseUrl}/v1/jobs/${job.id}/executions?limit=2`, { headers });
     expect(firstResponse.status).toBe(200);
     const firstPage: any = await firstResponse.json();
@@ -227,7 +273,7 @@ integration("Postgres + Redis runtime integration", () => {
 
   it("exposes authenticated queue, callback, and durable-job operational counts", async () => {
     const response = await fetch(`${baseUrl}/v1/operations/overview`, {
-      headers: { authorization: `Bearer ${process.env.TASKFLOW_API_KEY}` },
+      headers: { authorization: `Bearer ${operatorToken}` },
     });
 
     expect(response.status).toBe(200);

@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { parseApiClients } from "./lib/apiClientsConfig";
 import { parseHandlerConcurrencyLimits, parseHandlerRateLimits } from "./lib/handlerLimitsConfig";
 
 const commaSeparated = z
@@ -19,7 +20,8 @@ const envSchema = z.object({
   HANDLER_RATE_LIMITS: z.string().default(""),
   HANDLER_LIMIT_RETRY_DELAY_MS: z.coerce.number().int().positive().default(250),
   HANDLER_PERMIT_TTL_MS: z.coerce.number().int().min(5_000).default(60_000),
-  TASKFLOW_API_KEY: z.string().min(1, "TASKFLOW_API_KEY is required"),
+  TASKFLOW_API_CLIENTS: z.string().default(""),
+  TASKFLOW_API_KEY: z.string().default(""),
   CORS_ORIGINS: z
     .string()
     .default("")
@@ -43,12 +45,6 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-if (parsed.data.NODE_ENV === "production" && parsed.data.TASKFLOW_API_KEY.length < 32) {
-  console.error("Invalid environment configuration:");
-  console.error({ TASKFLOW_API_KEY: ["TASKFLOW_API_KEY must be at least 32 characters in production"] });
-  process.exit(1);
-}
-
 if (
   parsed.data.NODE_ENV === "production" &&
   parsed.data.CALLBACK_ALLOWED_HOSTS.length > 0 &&
@@ -63,17 +59,26 @@ if (
 
 let handlerConcurrencyLimits: Record<string, number>;
 let handlerRateLimits: Record<string, { max: number; windowMs: number }>;
+let apiClients: ReturnType<typeof parseApiClients>;
 try {
   handlerConcurrencyLimits = parseHandlerConcurrencyLimits(parsed.data.HANDLER_CONCURRENCY_LIMITS);
   handlerRateLimits = parseHandlerRateLimits(parsed.data.HANDLER_RATE_LIMITS);
+  apiClients = parseApiClients(parsed.data.TASKFLOW_API_CLIENTS);
 } catch (error: any) {
   console.error("Invalid environment configuration:");
-  console.error({ HANDLER_LIMITS: [error?.message ?? "Invalid handler limit configuration"] });
+  console.error({ CONFIGURATION: [error?.message ?? "Invalid application configuration"] });
   process.exit(1);
 }
 
+// The worker process shares this config module but does not serve the HTTP API,
+// so it should not need API-client secrets just to execute jobs. The API process
+// validates authentication requirements when createApp() is constructed.
+const legacyApiKey = parsed.data.NODE_ENV === "production" ? "" : parsed.data.TASKFLOW_API_KEY;
+
 export const config = {
   ...parsed.data,
+  TASKFLOW_API_CLIENTS: apiClients,
+  LEGACY_API_KEY: legacyApiKey,
   HANDLER_CONCURRENCY_LIMITS: handlerConcurrencyLimits,
   HANDLER_RATE_LIMITS: handlerRateLimits,
 };
