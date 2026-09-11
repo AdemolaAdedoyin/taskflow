@@ -11,13 +11,13 @@ function runAuth(authorization?: string) {
 
 describe("API key authentication", () => {
   it("accepts the configured bearer token", () => {
-    const next = runAuth("Bearer test-key");
+    const next = runAuth(`Bearer ${process.env.TASKFLOW_API_KEY}`);
     expect(next).toHaveBeenCalledTimes(1);
     expect(next).toHaveBeenCalledWith();
   });
 
   it("rejects missing or incorrect credentials", () => {
-    for (const authorization of [undefined, "Bearer wrong-key", "Basic test-key"]) {
+    for (const authorization of [undefined, "Bearer wrong-key", `Basic ${process.env.TASKFLOW_API_KEY}`]) {
       const next = runAuth(authorization);
       expect(next).toHaveBeenCalledTimes(1);
       expect(next.mock.calls[0][0]).toMatchObject({ statusCode: 401 });
