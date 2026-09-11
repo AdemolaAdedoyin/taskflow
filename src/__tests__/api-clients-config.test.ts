@@ -19,8 +19,9 @@ describe("API client configuration", () => {
     ]);
   });
 
-  it("rejects malformed clients, duplicate ids, and invalid scopes", () => {
+  it("rejects malformed clients, ambiguous ids, duplicate ids, and invalid scopes", () => {
     expect(() => parseApiClients("writer:secret")).toThrow(/clientId:secret:scope/);
+    expect(() => parseApiClients("service.prod:secret:jobs.read")).toThrow(/client id/);
     expect(() => parseApiClients("writer:secret:jobs.read,writer:secret2:jobs.write")).toThrow(/Duplicate/);
     expect(() => parseApiClients("writer:secret:jobs.delete")).toThrow(/Allowed scopes/);
     expect(() => parseApiClients("admin:secret:*|jobs.read")).toThrow(/cannot combine/);
